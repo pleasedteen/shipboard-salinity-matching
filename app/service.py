@@ -302,8 +302,8 @@ class SamplingService:
             )
             # Re-derive the rows so a reverted material owns its records again;
             # derived lab rows otherwise still point at the superseded version.
-            self._extract(prior["id"], voyage, prior["slug"], prior["name"],
-                          prior["content"], prior["kind"])
+            extraction = self._extract(prior["id"], voyage, prior["slug"], prior["name"],
+                                       prior["content"], prior["kind"])
             self._refresh_lab_activity()
             report.material_id = prior["id"]
             if previous_active is not None:
@@ -314,9 +314,21 @@ class SamplingService:
             else:
                 report.status = "restored"
             report.records = self._record_count(prior["id"])
-            affected = set(self._batch_keys_for_material(prior["id"]))
+            # Record-level links follow whichever version was active last, so
+            # they cannot be relied on to find the batches a restored version
+            # feeds.  Derive them from the restored rows themselves, and keep
+            # the links of every other version of this material as well.
+            affected = set(self._batch_keys_for_findings(
+                voyage, prior["kind"], extraction.findings))
+            for row in self.db.fetchall(
+                "SELECT id FROM materials WHERE voyage = ? AND slug = ?", (voyage, slug)
+            ):
+                affected |= set(self._batch_keys_for_material(row["id"]))
             if previous_active is not None:
                 affected |= set(self._batch_keys_for_material(previous_active["id"]))
+            if prior["kind"] == "handover":
+                # A handover sheet can add, remove or redefine any of its batches.
+                affected |= set(self._batch_keys_for_voyage(voyage))
             report.affected_batches = sorted(affected)
             self._refresh_batches(report.affected_batches)
             return report
@@ -361,12 +373,7 @@ class SamplingService:
         report.records = len(extraction.findings)
         report.warnings.extend(extraction.warnings)
 
-        if kind == "lab":
-            affected |= self._batch_keys_for_lab(voyage, extraction.findings)
-        if kind == "deck":
-            affected |= self._batch_keys_for_deck(voyage, extraction.findings)
-        if kind == "handover":
-            affected |= {f"{voyage}|{code}" for code in self._handover_codes(extraction.findings)}
+        affected = set(self._batch_keys_for_findings(voyage, kind, extraction.findings))
         report.affected_batches = sorted(affected)
         self._refresh_batches(report.affected_batches)
         return report
@@ -456,8 +463,14 @@ class SamplingService:
     def _extract(self, material_id: str, voyage: str, slug: str, name: str,
                  content: str, kind: str):
         document = parse_document(content, name)
-        result = EXTRACTORS[kind](document, slug, name)
-        corrections = self._corrections_for({f.record_key for f in result.findings})
+        # Record keys are scoped to the material's own identity.  A revision of
+        # the same material keeps its keys (so corrections replay); the same
+        # bytes imported as another material never share them.
+        scope = f"{voyage}|{slug}"
+        result = EXTRACTORS[kind](document, slug, name, scope=scope)
+        corrections = self._corrections_for(
+            {f.record_key for f in result.findings}, voyage=voyage
+        )
         for finding in result.findings:
             decision = corrections.get(finding.record_key)
             if not decision:
@@ -471,6 +484,13 @@ class SamplingService:
                 continue
             finding.fields.update(_normalise_corrected(decision.get("fields") or {}))
             finding.fingerprint = canonical_json(finding.identity())
+
+        # A correction whose record key is no longer produced by this
+        # material's current content (a row removed or rewritten) must not
+        # linger as active: nothing would replay it, and the review queue
+        # would claim a decision that is no longer backed by the source.
+        self._invalidate_orphaned_corrections(voyage, slug,
+                                              {f.record_key for f in result.findings})
 
         self.db.execute("DELETE FROM raw_records WHERE material_id = ?", (material_id,))
         for index, finding in enumerate(result.findings):
@@ -489,13 +509,19 @@ class SamplingService:
             self._sync_lab_results(material_id, voyage, result.findings)
         return result
 
-    def _corrections_for(self, record_keys: set[str]) -> dict[str, dict[str, Any]]:
+    def _corrections_for(self, record_keys: set[str],
+                         voyage: str | None = None) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         for record_key in sorted(record_keys):
+            clauses = ["record_key = ?", "kind = 'correction'", "active = 1"]
+            params: list[Any] = [record_key]
+            if voyage is not None:
+                clauses.append("voyage = ?")
+                params.append(voyage)
             rows = self.db.fetchall(
-                "SELECT * FROM review_decisions WHERE record_key = ? AND kind = 'correction' "
-                "AND active = 1 ORDER BY updated_at DESC",
-                (record_key,),
+                "SELECT * FROM review_decisions WHERE " + " AND ".join(clauses)
+                + " ORDER BY updated_at DESC",
+                params,
             )
             if not rows:
                 continue
@@ -503,6 +529,31 @@ class SamplingService:
             if isinstance(value, dict) and value.get("fields"):
                 out[record_key] = {"id": rows[0]["id"], **value}
         return out
+
+    def _invalidate_orphaned_corrections(self, voyage: str, slug: str,
+                                         current_keys: set[str]) -> None:
+        """Invalidate this material's corrections whose row no longer exists.
+
+        Record keys are scoped to the material identity, so a correction can
+        only be orphaned when its key belonged to this slug in this voyage.
+        Corrections belonging to other materials of the same voyage are left
+        alone.
+        """
+        keys_for_slug = {
+            row["record_key"] for row in self.db.fetchall(
+                "SELECT DISTINCT r.record_key FROM raw_records r "
+                "JOIN materials m ON m.id = r.material_id "
+                "WHERE m.voyage = ? AND m.slug = ?", (voyage, slug))
+        }
+        for row in self.db.fetchall(
+            "SELECT * FROM review_decisions WHERE kind = 'correction' AND active = 1 "
+            "AND voyage = ?", (voyage,),
+        ):
+            if row["record_key"] in keys_for_slug and row["record_key"] not in current_keys:
+                self._invalidate_decision(
+                    row["id"],
+                    "the material no longer contains this row; the correction was superseded",
+                )
 
     def _sync_lab_results(self, material_id: str, voyage: str, findings: list[Any]) -> None:
         stamp = now_iso()
@@ -596,6 +647,19 @@ class SamplingService:
 
     def _batch_keys_for_voyage(self, voyage: str) -> list[str]:
         return sorted({f"{r['voyage']}|{r['batch_code']}" for r in self._batches_in_voyage(voyage)})
+
+    def _batch_keys_for_findings(self, voyage: str, kind: str,
+                                 findings: list[Any]) -> set[str]:
+        """Batches whose resolution a set of freshly extracted rows can affect."""
+        if not findings:
+            return set()
+        if kind == "lab":
+            return self._batch_keys_for_lab(voyage, findings)
+        if kind == "deck":
+            return self._batch_keys_for_deck(voyage, findings)
+        if kind == "handover":
+            return {f"{voyage}|{code}" for code in self._handover_codes(findings)}
+        return set()
 
     def _batch_keys_for_lab(self, voyage: str, findings: list[Any]) -> set[str]:
         """Batches whose resolution could change because of these lab rows.
@@ -1332,12 +1396,16 @@ class SamplingService:
 
         # Extraction quality items for records actually consumed by this
         # batch: the linked handover/deck rows and the laboratory rows in the
-        # batch's own result pool.
+        # batch's own result pool.  Only the *active* version of a material is
+        # evidence: a superseded version keeps its rows (so a revert can
+        # restore them) but its extracted text must not be quoted or corrected
+        # in place of the current one.
         consumed: set[tuple[str, str]] = {
             (row["material_id"], row["record_key"])
             for row in self.db.fetchall(
                 "SELECT DISTINCT i.material_id, i.record_key FROM batch_inputs i "
-                "WHERE i.batch_id = ?",
+                "JOIN materials m ON m.id = i.material_id "
+                "WHERE i.batch_id = ? AND m.status = 'active'",
                 (batch["id"],),
             )
         }
@@ -1348,7 +1416,7 @@ class SamplingService:
             row = self.db.fetchone(
                 "SELECT r.*, m.slug, m.name AS file_name FROM raw_records r "
                 "JOIN materials m ON m.id = r.material_id "
-                "WHERE r.material_id = ? AND r.record_key = ?",
+                "WHERE r.material_id = ? AND r.record_key = ? AND m.status = 'active'",
                 (material_id, record_key),
             )
             if row is not None:
@@ -1560,6 +1628,7 @@ class SamplingService:
             res = by_bottle.get(bottle["record_key"])
             lab = lab_map.get(res["lab_result_id"]) if res else None
             payload = from_json(res.get("payload"), {}) if res else {}
+            bottle_payload = from_json(bottle.get("payload"), {})
             items.append({
                 "bottle_key": bottle["record_key"],
                 "label": bottle["label_raw"],
@@ -1577,7 +1646,8 @@ class SamplingService:
                 },
                 "provenance": {
                     "handover": from_json(bottle.get("locator"), {}),
-                    "deck": payload.get("deck_locators", []),
+                    "deck": bottle_payload.get("deck_locators")
+                    or payload.get("deck_locators", []),
                     "lab": from_json(lab.get("locator"), {}) if lab else {},
                 },
                 "matching_reasons": payload.get("matching_reasons", []),
@@ -1648,6 +1718,7 @@ class SamplingService:
             "SELECT br.*, b.batch_code, b.voyage, b.status AS batch_status, "
             "b.station AS batch_station, bb.ordinal, bb.label_raw, bb.station AS bottle_station, "
             "bb.sampled_at, bb.locator AS bottle_locator, bb.confidence AS bottle_confidence, "
+            "bb.payload AS bottle_payload, "
             "lr.locator AS result_locator, lr.label_raw AS result_label, "
             "lr.confidence AS result_confidence, lr.payload AS result_payload "
             "FROM batch_results br JOIN batches b ON b.id = br.batch_id "
@@ -1683,6 +1754,14 @@ class SamplingService:
         for row in rows[offset: offset + limit]:
             payload = from_json(row.get("payload"), {})
             lab_payload = from_json(row.get("result_payload"), {})
+            bottle_payload = from_json(row.get("bottle_payload"), {})
+            # Deck provenance is read from the bottle's current link rather
+            # than the frozen batch_result payload: a revised deck material
+            # shifts line numbers, and the query must point at the current
+            # version's row, not the one captured when the batch resolved.
+            deck_locators = bottle_payload.get("deck_locators")
+            if deck_locators is None:
+                deck_locators = payload.get("deck_locators", [])
             items.append({
                 "batch": row["batch_code"],
                 "batch_id": row["batch_id"],
@@ -1705,7 +1784,7 @@ class SamplingService:
                 },
                 "provenance": {
                     "handover": row["bottle_locator"] and from_json(row["bottle_locator"], {}),
-                    "deck": payload.get("deck_locators", []),
+                    "deck": deck_locators,
                     "lab": row["result_locator"] and from_json(row["result_locator"], {}),
                     "lab_reasons": lab_payload.get("reason_codes", []),
                     "matching_reasons": payload.get("matching_reasons", []),
@@ -1746,10 +1825,16 @@ class SamplingService:
         if row is None:
             raise NotFound(f"review item '{item_id}' not found")
         public = self._review_public(row)
-        material = self.db.fetchone(
-            "SELECT id, slug, name, kind FROM materials WHERE slug = ? AND status = 'active'",
-            (row["source_material"],),
-        ) if row["source_material"] else None
+        material = None
+        if row["source_material"]:
+            # Scope the source lookup to the item's voyage: the same slug can
+            # exist in more than one voyage, and showing the wrong voyage's
+            # text would misrepresent what the reviewer is deciding on.
+            material = self.db.fetchone(
+                "SELECT id, slug, name, kind FROM materials "
+                "WHERE slug = ? AND voyage = ? AND status = 'active'",
+                (row["source_material"], row["voyage"]),
+            )
         if material:
             public["source"] = {
                 "material_id": material["id"],
@@ -1939,9 +2024,23 @@ class SamplingService:
             })
             return
         record_key = item["record_key"]
-        record = self.db.fetchone("SELECT * FROM raw_records WHERE record_key = ?", (record_key,))
+        # Resolve the row the reviewer is looking at.  A record key belongs to
+        # exactly one material; corrections must always land on the current
+        # active version of that material, never on a superseded copy.
+        record = self.db.fetchone(
+            "SELECT r.* FROM raw_records r JOIN materials m ON m.id = r.material_id "
+            "WHERE r.record_key = ? AND m.status = 'active' "
+            "ORDER BY m.updated_at DESC",
+            (record_key,),
+        )
         if record is None:
-            raise NotFound(f"source record '{record_key}' not found")
+            # A revert or replacement can leave the review item pointing at a
+            # version that is no longer active; the current materials no longer
+            # contain that row, so the correction cannot be applied.
+            raise Conflict(
+                f"source record '{record_key}' is no longer part of an active material; "
+                "refresh the review queue"
+            )
         original = from_json(record["payload"], {})
         fields = dict(value.get("fields") or {})
         if action == "correct" and not fields:

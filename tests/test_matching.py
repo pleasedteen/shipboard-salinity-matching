@@ -130,7 +130,10 @@ class ReviewFlowTests(ServiceTestCase):
         # Batch E is held because one bottle has no laboratory result.
         items = self.open_items("KX-2603-E", "low_confidence_extraction")
         self.assertTrue(items)
-        item = items[0]
+        # Correct the truncated fragment (the missing-label row would complete
+        # the batch; this one cannot).
+        item = next(i for i in items
+                    if "…" in (i["payload"]["fields"].get("label_raw") or ""))
         record_key = item["record_key"]
         self.service.decide(item["id"], "correct", reviewer="张敏",
                             value={"fields": {"label_raw": "S05-002"}})

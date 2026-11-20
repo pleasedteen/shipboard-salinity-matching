@@ -327,18 +327,23 @@ class ExtractResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _occurrence_keys(findings: list[ExtractFinding]) -> None:
+def _occurrence_keys(findings: list[ExtractFinding], scope: str | None = None) -> None:
     """Make record keys deterministic and unique within one material.
 
-    Keys are derived from semantics plus the occurrence number of that
-    semantic tuple, so replacing a material without changing a row keeps its
-    key (and therefore reviewer decisions).
+    Keys are derived from the material's own identity (voyage and slug) plus
+    the row's semantics and occurrence number.  Two consequences matter:
+
+    * replacing a material without changing a row keeps its key, so reviewer
+      corrections and pairing decisions continue to apply to that material;
+    * the same bytes imported as another material (a different voyage or a
+      different filename) produce different keys, so a decision made for one
+      material is never inherited by the other.
     """
     seen: dict[str, int] = {}
     for finding in findings:
         fields = finding.fields
         seed = finding.identity()
-        base = canonical_json(seed)
+        base = canonical_json([scope, seed]) if scope else canonical_json(seed)
         occurrence = seen.get(base, 0)
         seen[base] = occurrence + 1
         finding.record_key = short_id(finding.kind, base, occurrence)
@@ -349,7 +354,8 @@ def _occurrence_keys(findings: list[ExtractFinding]) -> None:
 # Deck sampling log
 # ---------------------------------------------------------------------------
 
-def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str) -> ExtractResult:
+def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str,
+                 scope: str | None = None) -> ExtractResult:
     """Parse a deck sampling log.
 
     A station heading governs all following detail rows.  Tables may continue
@@ -487,7 +493,7 @@ def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str) ->
             seen.add(dedupe)
             result.findings.append(finding)
 
-    _occurrence_keys(result.findings)
+    _occurrence_keys(result.findings, scope)
     if not result.findings:
         result.warnings.append("no deck sample rows recognised")
     return result
@@ -497,7 +503,8 @@ def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str) ->
 # Bottle handover sheet
 # ---------------------------------------------------------------------------
 
-def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str) -> ExtractResult:
+def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str,
+                     scope: str | None = None) -> ExtractResult:
     """Parse a bottle handover sheet that defines dispatch-batch membership."""
     result = ExtractResult(kind="handover")
     current_batch: str | None = None
@@ -616,7 +623,7 @@ def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str
             seen.add(dedupe)
             result.findings.append(finding)
 
-    _occurrence_keys(result.findings)
+    _occurrence_keys(result.findings, scope)
     if not result.findings:
         result.warnings.append("no handover bottles recognised")
     return result
@@ -626,7 +633,8 @@ def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str
 # Laboratory salinity report
 # ---------------------------------------------------------------------------
 
-def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> ExtractResult:
+def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str,
+                scope: str | None = None) -> ExtractResult:
     """Parse laboratory salinity results.
 
     Hand-written transcripts may carry a truncated bottle label and omit the
@@ -781,7 +789,7 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
             seen.add(dedupe)
             result.findings.append(finding)
 
-    _occurrence_keys(result.findings)
+    _occurrence_keys(result.findings, scope)
     if not result.findings:
         result.warnings.append("no laboratory salinity rows recognised")
     return result
