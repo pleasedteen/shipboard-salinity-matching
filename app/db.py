@@ -208,6 +208,39 @@ SCHEMA: tuple[str, ...] = (
         summary TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS page_sets (
+        id TEXT PRIMARY KEY,
+        voyage TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        expected_pages INTEGER NOT NULL,
+        format TEXT NOT NULL DEFAULT 'text',
+        kind TEXT NOT NULL DEFAULT 'deck',
+        name TEXT,
+        status TEXT NOT NULL,
+        material_id TEXT,
+        page_map TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pageset_key ON page_sets(voyage, slug, version)",
+    "CREATE INDEX IF NOT EXISTS idx_pageset_material ON page_sets(material_id)",
+    """
+    CREATE TABLE IF NOT EXISTS material_pages (
+        id TEXT PRIMARY KEY,
+        page_set_id TEXT NOT NULL,
+        page_no INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT,
+        content TEXT NOT NULL,
+        content_sha TEXT NOT NULL,
+        received_at TEXT NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_material_pages_no "
+    "ON material_pages(page_set_id, page_no)",
 )
 
 

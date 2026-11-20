@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from app.config import Settings  # noqa: E402
+from app.document import PageInput  # noqa: E402
 from app.service import MaterialInput, SamplingService  # noqa: E402
 
 FIXTURE_FILES = (
@@ -123,7 +124,65 @@ def demo() -> str:
             )
         finally:
             service.db.close()
+    lines.extend(demo_paged())
     return "\n".join(lines)
+
+
+def demo_paged() -> list[str]:
+    """Offline walk-through: out-of-order page upload with a re-sent page."""
+    fixtures = ROOT / "fixtures" / "paged_deck"
+    voyage = "PG-26-01"
+    lines: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        service = SamplingService(settings=Settings(
+            database_url=f"sqlite:///{Path(tmp) / 'paged.db'}", fixture_dir=fixtures,
+        ))
+        try:
+            service.import_materials([
+                MaterialInput(name="handover.html",
+                              content=(fixtures / "handover.html").read_text("utf-8"),
+                              kind="handover", voyage=voyage),
+                MaterialInput(name="lab_results.txt",
+                              content=(fixtures / "lab_results.txt").read_text("utf-8"),
+                              kind="lab", voyage=voyage),
+            ])
+
+            def page(number: int) -> PageInput:
+                return PageInput(page_no=number, name=f"deck_p{number}.txt",
+                                 content=(fixtures / f"deck_p{number}.txt").read_text("utf-8"))
+
+            def upload(*numbers: int):
+                return service.import_pages([MaterialInput(
+                    name="deck", content="", kind="deck", voyage=voyage, slug="deck",
+                    pages=[page(n) for n in numbers], version=1, expected_pages=4,
+                )])[0]
+
+            lines.append("")
+            lines.append("7. Long deck table uploaded page by page, out of order")
+            for label, numbers in (("page 3", (3,)), ("page 1", (1,)),
+                                   ("page 1 again", (1,)), ("page 4", (4,)),
+                                   ("page 2", (2,))):
+                report = upload(*numbers)
+                lines.append(
+                    f"   - send {label:<12} status={report.status:<10} "
+                    f"have={report.received_pages} missing={report.missing_pages}"
+                )
+                if report.status == "activated":
+                    state = {b["batch_code"]: b["status"] for b in
+                             service.list_batches(voyage=voyage)}
+                    lines.append(f"     switched to version {report.version}: {state}")
+
+            lines.append("")
+            lines.append("8. Evidence still points at the original page file")
+            for item in service.query_samples(voyage=voyage, batch="PG-2601-A")["items"][:2]:
+                deck = item["provenance"]["deck"][0]
+                lines.append(
+                    f"   - {item['label']:<9} {item['salinity']:>7} PSU  "
+                    f"{deck['file']}:{deck['line']} (page {deck['page']})"
+                )
+        finally:
+            service.db.close()
+    return lines
 
 
 def main() -> int:

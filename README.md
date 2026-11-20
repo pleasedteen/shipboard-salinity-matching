@@ -9,6 +9,7 @@
 - 复核队列展示候选与原文；核正后结果立即反映到查询接口。
 - 单独替换或撤回一份材料只重跑受影响的批次；材料含义未变时既有复核决定继续有效。
 - 重复导入不增加记录；中断后可重跑。
+- 长甲板表可整份拆页上传：页可乱序、可重发；缺页期间查询与复核沿用上一个完整版本，收齐后统一切换；迟到的旧版页仍归旧版。
 
 ---
 
@@ -67,6 +68,51 @@ python3 run.py review  --status open
 | `replace` | 否 | 请求级参数；语义见第 4 节 |
 
 \* `content` 与 `path` 至少提供一个。
+
+### 整份上传 vs 分页上传
+
+较短的甲板记录可以整份作为 `content` 提交（见上文）。较长的甲板长表按页拆成多个文件时，用下面的分页接口：
+
+```
+POST /api/materials/pages
+{
+  "voyage": "PG-26-01",
+  "materials": [{
+    "slug": "deck", "kind": "deck",
+    "version": 1,          // 省略时自动推断，见第 4 节
+    "expected_pages": 4,
+    "pages": [
+      {"page": 3, "name": "deck_p3.txt", "content": "……"},
+      {"page": 1, "name": "deck_p1.txt", "content": "……"}
+    ]
+  }]
+}
+```
+
+- 页可按任意顺序到达，也可多次重发；同一页内容相同即无操作，内容不同则覆盖该页。
+- 只有 `expected_pages` 页全部到齐，该版本才整体切换为生效材料；缺页期间查询、复核继续使用上一个完整版本，不做任何重算。
+- 服务重启后继续补齐：未收齐的版本状态保存在库里，新进程直接接着收。
+- 迟到的旧版页仍记在旧版本下（`status: late_page`），即使它让旧版本收齐也不会顶掉当前生效版本；旧版内容只作归档，可查询但不参与批次发布。
+- 每页单独解析后再按页序拼成一条连续事件流，因此续页会继承前页的站次、日期与栏头。
+- 证据定位到**原始页文件与行号**：`provenance.deck[0]` 的 `file` / `line` 指向 `deck_p3.txt` 的第几行，`page` 为逻辑页码。
+- 等义重分页（内容不变、只是页边界不同）不会改变批次语义指纹，既有的复核决定继续有效。
+
+查询分页收集状态：
+
+```
+GET /api/page-sets?voyage=PG-26-01
+GET /api/page-sets/deck?voyage=PG-26-01[&version=1]
+```
+
+命令行等价操作：
+
+```bash
+python3 run.py pages fixtures/paged_deck --voyage PG-26-01 --slug deck \
+    --expected-pages 4 --version 1
+python3 run.py page-set deck --voyage PG-26-01
+```
+
+`pages` 从文件名末尾的数字推断页号（`deck_p3.txt` → 第 3 页）。只把甲板表交给它；交接单和实验室结果仍按上面的整份材料导入。
 
 ### 三类材料
 
@@ -206,6 +252,7 @@ POST /api/review/{item_id}/decide
    - 唯一完美匹配 → `published`。
 4. **一果一瓶**：一条实验室结果最多属于一个瓶、一个批次；同航次内跨批次解析时会互相排除。
 5. 复核人确认配对后，该批次的确认结果以 `confirmed` 状态发布，查询与复核队列同步更新为同一版本。
+6. **整份收齐才切换**：分页上传的材料，缺页期间不产生任何部分版本，查询与复核沿用上一个完整版本；收齐那一刻一次性切换并只重跑受影响的批次。
 
 ---
 
@@ -216,6 +263,7 @@ POST /api/review/{item_id}/decide
 - 仅仅某个**盐度数值**被更正：指纹不变 → 决定继续有效，批次保持已发布，只是新版数值生效。
 - 标签、站次、时段或**可行配对集合**发生变化：指纹改变 → 旧决定标记为 `invalidated`，批次重新进入复核，复核项重新打开。
 - 抽取更正（`low_confidence_extraction`）会在材料被重新导入时**重放**：只要该行仍以相同语义存在，更正继续生效；若该行本身变了，更正自动失效并记录原因。
+- **等义重分页**（内容不变，只是页边界或页文件不同）不会改变指纹：记录键由语义与出现序号生成，与版面和页码无关；因此既有的复核决定继续有效，而证据位置会更新为新页文件与行号。
 
 ---
 
@@ -263,6 +311,7 @@ python3 -m unittest discover -s tests -t tests -v
 | `handover.html` | 交接单 | 8 个送检批次，跨页；批 H 复用批 A 的瓶签（同批内瓶号唯一） |
 | `lab_results_1.txt` | 实验室 | 4 个批次，含「样品编号 + 瓶号」两列 |
 | `lab_results_2.html` | 实验室 | 瓶签片段（`…05-001`、`S07-00…`）与缺失瓶号（`—`），需要结合站次与采样时段；含一个不属于任何交接批次的批次 `KX-2603-I` |
+| `paged_deck/` | 分页甲板记录 | 航次 `PG-26-01` 的四页甲板表 + 交接单 + 实验室结果；第 2、4 页为续页且不重印站次标题，用于乱序补页、重发与版本切换 |
 
 由此产生的预期结果：
 
@@ -281,10 +330,10 @@ python3 -m unittest discover -s tests -t tests -v
 app/
   config.py     配置与连接串脱敏
   db.py         统一 DB-API（SQLite 嵌入式 / PostgreSQL 生产），事务与表结构
-  document.py   HTML / 文本 → 统一事件流（标题/段落/表格，含 colspan/rowspan）
+  document.py   HTML / 文本 → 统一事件流（标题/段落/表格，含 colspan/rowspan；分页拼装）
   extract.py    三类材料的抽取、栏名同义词、翻页续写、页码与置信度
   matching.py   瓶签/站次/时段兼容性、完美匹配、候选集与语义指纹
-  service.py    导入、批次解析、版本发布、复核决定、查询
+  service.py    导入、分页收集与版本切换、批次解析、版本发布、复核决定、查询
   api.py        stdlib HTTP 服务与 JSON 接口
 run.py          命令行入口（serve / import / revise / withdraw / query / review …）
 verify.py       一条命令完成验证

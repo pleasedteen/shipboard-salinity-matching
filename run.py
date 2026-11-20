@@ -13,11 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from app.api import serve
 from app.config import Settings
+from app.document import PageInput
 from app.service import MaterialInput, SamplingService, ServiceError
 
 ROOT = Path(__file__).resolve().parent
@@ -84,6 +86,62 @@ def cmd_withdraw(args: argparse.Namespace) -> int:
     return 0
 
 
+def page_number_from_name(path: Path) -> int | None:
+    """Read a page number out of a filename such as ``deck_p02.txt`` or ``2.txt``."""
+    stem = path.stem
+    m = re.search(r"(?:^|[^0-9])(\d{1,3})$", stem)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:页|page|p)[-_ ]?(\d{1,3})", stem, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def cmd_pages(args: argparse.Namespace) -> int:
+    service = service_for(args)
+    directory = Path(args.directory)
+    if not directory.is_dir():
+        print(f"not a directory: {directory}", file=sys.stderr)
+        return 2
+    pages: list[PageInput] = []
+    for item in sorted(directory.iterdir()):
+        if not item.is_file() or item.suffix.lower() not in (".html", ".htm", ".txt", ".md", ".csv"):
+            continue
+        number = page_number_from_name(item)
+        if number is None:
+            print(f"cannot infer a page number from '{item.name}'", file=sys.stderr)
+            return 2
+        pages.append(PageInput(page_no=number, name=item.name,
+                               content=item.read_text(encoding="utf-8")))
+    if not pages:
+        print("no page files found", file=sys.stderr)
+        return 2
+    versions = {p.page_no for p in pages}
+    if len(versions) != len(pages):
+        print("two files claim the same page number", file=sys.stderr)
+        return 2
+    expected = args.expected_pages or len(pages)
+    report = service.import_pages([MaterialInput(
+        name=args.slug, content="", kind=args.kind, voyage=args.voyage,
+        slug=args.slug, pages=pages, version=args.version, expected_pages=expected,
+    )])[0]
+    print(json.dumps(report.public(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_pageset(args: argparse.Namespace) -> int:
+    service = service_for(args)
+    if args.slug:
+        print(json.dumps(service.get_page_set(
+            args.slug, voyage=args.voyage, version=args.version,
+        ), ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(service.list_page_sets(voyage=args.voyage),
+                         ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_batches(args: argparse.Namespace) -> int:
     service = service_for(args)
     print(json.dumps(service.list_batches(voyage=args.voyage, status=args.status),
@@ -141,6 +199,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kind", choices=["deck", "handover", "lab"])
     p.add_argument("--replace", action="store_true")
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("pages", help="upload one material as separate page files")
+    p.add_argument("directory")
+    p.add_argument("--slug", required=True)
+    p.add_argument("--voyage", default="default")
+    p.add_argument("--kind", choices=["deck", "handover", "lab"])
+    p.add_argument("--version", type=int)
+    p.add_argument("--expected-pages", type=int)
+    p.set_defaults(func=cmd_pages)
+
+    p = sub.add_parser("page-set", help="show page collection state")
+    p.add_argument("slug", nargs="?")
+    p.add_argument("--voyage")
+    p.add_argument("--version", type=int)
+    p.set_defaults(func=cmd_pageset)
 
     p = sub.add_parser("revise", help="replace one material")
     p.add_argument("slug")

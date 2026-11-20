@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from . import matching
 from .config import Settings
 from .db import Database
-from .document import parse_document
+from .document import PageInput, assemble_pages, assemble_text, document_format, parse_document
 from .extract import EXTRACTORS, guess_kind
 from .util import (
     canonical_json,
@@ -57,11 +57,17 @@ class Conflict(ServiceError):
 @dataclass
 class MaterialInput:
     name: str
-    content: str
+    content: str = ""
     kind: str | None = None
     voyage: str = DEFAULT_VOYAGE
     slug: str | None = None
     path: str | None = None
+    # A long deck table may be uploaded as separate page files.  ``version``
+    # names the material version the pages belong to; ``expected_pages`` is how
+    # many pages that version has in total.
+    pages: list[PageInput] | None = None
+    version: int | None = None
+    expected_pages: int | None = None
 
 
 @dataclass
@@ -91,6 +97,52 @@ class IngestReport:
             "withdrawn": self.withdrawn,
             "records": self.records,
             "replaced_material_id": self.replaced_material_id,
+            "affected_batches": self.affected_batches,
+            "warnings": self.warnings,
+        }
+
+
+@dataclass
+class PageIngestReport:
+    """Outcome of one page upload against a material version."""
+
+    name: str
+    slug: str
+    kind: str
+    voyage: str
+    version: int
+    expected_pages: int
+    status: str = "collecting"
+    material_id: str | None = None
+    activated: bool = False
+    records: int = 0
+    replaced_material_id: str | None = None
+    stored_pages: list[int] = field(default_factory=list)
+    replaced_pages: list[int] = field(default_factory=list)
+    unchanged_pages: list[int] = field(default_factory=list)
+    missing_pages: list[int] = field(default_factory=list)
+    received_pages: list[int] = field(default_factory=list)
+    affected_batches: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "material_id": self.material_id,
+            "name": self.name,
+            "slug": self.slug,
+            "kind": self.kind,
+            "voyage": self.voyage,
+            "version": self.version,
+            "expected_pages": self.expected_pages,
+            "status": self.status,
+            "activated": self.activated,
+            "records": self.records,
+            "replaced_material_id": self.replaced_material_id,
+            "received_pages": self.received_pages,
+            "missing_pages": self.missing_pages,
+            "stored_pages": self.stored_pages,
+            "replaced_pages": self.replaced_pages,
+            "unchanged_pages": self.unchanged_pages,
             "affected_batches": self.affected_batches,
             "warnings": self.warnings,
         }
@@ -257,6 +309,476 @@ class SamplingService:
             "SELECT * FROM materials WHERE voyage = ? AND slug = ? AND status = 'active'",
             (voyage, slug),
         )
+
+    # ==================================================================
+    # Page-wise collection of a long deck table
+    # ==================================================================
+    def import_pages(
+        self,
+        materials: Iterable[MaterialInput],
+        trigger: str = "api",
+    ) -> list[PageIngestReport]:
+        """Receive page files that together make up one material version.
+
+        Pages may arrive in any order and may be re-sent.  A material version
+        becomes active only when every page it declares has been received; until
+        then queries and review keep using the previous complete version.  A
+        page sent for an older version is still recorded against that version
+        (``late_page``) and never leaks into the active one.
+        """
+        items = list(materials)
+        if not items:
+            return []
+        run_seq = self.db.scalar("SELECT COUNT(*) FROM runs", (), 0)
+        run_id = short_id("run", now_iso(), trigger, len(items), run_seq)
+        with self.db.transaction():
+            self.db.insert("runs", {
+                "id": run_id,
+                "trigger": trigger,
+                "status": "running",
+                "started_at": now_iso(),
+                "summary": None,
+            })
+        try:
+            with self.db.transaction():
+                reports = [self._import_pages_one(m) for m in items]
+                self.db.update("runs", run_id, {
+                    "status": "completed",
+                    "finished_at": now_iso(),
+                    "summary": to_json([r.public() for r in reports]),
+                })
+            return reports
+        except BaseException as exc:
+            with self.db.transaction():
+                self.db.update("runs", run_id, {
+                    "status": "failed",
+                    "finished_at": now_iso(),
+                    "summary": to_json({"error": str(exc)}),
+                })
+            raise
+
+    def _import_pages_one(self, material: MaterialInput) -> PageIngestReport:
+        voyage = slugify(material.voyage or DEFAULT_VOYAGE)
+        if not material.pages:
+            raise ServiceError("page upload requires at least one page")
+        first = sorted(material.pages, key=lambda p: p.page_no)[0]
+        slug = material.slug or slugify(Path(material.name or first.name).stem)
+        kind = (material.kind or guess_kind(material.name or first.name, first.content)).lower()
+        if kind not in KINDS:
+            raise ServiceError(f"unknown material kind '{kind}'")
+        for page in material.pages:
+            if page.page_no < 1:
+                raise ServiceError("page numbers start at 1")
+
+        active = self._active_material(voyage, slug)
+        active_version = int(active["version"]) if active else 0
+        expected = int(material.expected_pages or 0)
+        if expected < 1:
+            raise ServiceError("expected_pages must be a positive integer")
+        if material.version is not None:
+            version = int(material.version)
+        else:
+            version = self._resolve_page_version(voyage, slug, material.pages, active_version)
+
+        page_set = self.db.fetchone(
+            "SELECT * FROM page_sets WHERE voyage = ? AND slug = ? AND version = ?",
+            (voyage, slug, version),
+        )
+        if page_set is None:
+            page_set = self._create_page_set(voyage, slug, kind, version, expected,
+                                             material, first)
+        else:
+            if int(page_set["expected_pages"]) != expected:
+                if self._page_set_complete(page_set):
+                    raise Conflict(
+                        f"version {version} of '{slug}' is already complete with "
+                        f"{page_set['expected_pages']} pages; use a new version to change it")
+                self.db.update("page_sets", page_set["id"], {
+                    "expected_pages": expected, "updated_at": now_iso(),
+                })
+            if material.kind and material.kind.lower() != page_set["kind"]:
+                raise Conflict(f"version {version} of '{slug}' is already {page_set['kind']}")
+            if material.name and not page_set.get("name"):
+                self.db.update("page_sets", page_set["id"], {
+                    "name": material.name, "updated_at": now_iso(),
+                })
+            kind = page_set["kind"]
+            page_set = self._page_set_row(page_set["id"])
+
+        report = PageIngestReport(
+            name=material.name, slug=slug, kind=page_set["kind"], voyage=voyage,
+            version=version, expected_pages=int(page_set["expected_pages"]),
+        )
+        complete_before = self._page_set_complete(page_set)
+
+        for page in sorted(material.pages, key=lambda p: p.page_no):
+            if page.page_no > int(page_set["expected_pages"]):
+                raise ServiceError(
+                    f"page {page.page_no} is beyond expected_pages="
+                    f"{page_set['expected_pages']} for version {version}")
+            sha = content_hash(page.content)
+            existing = self.db.fetchone(
+                "SELECT * FROM material_pages WHERE page_set_id = ? AND page_no = ?",
+                (page_set["id"], page.page_no),
+            )
+            if existing is not None and existing["content_sha"] == sha:
+                report.unchanged_pages.append(page.page_no)
+                continue
+            if existing is not None:
+                self.db.update("material_pages", existing["id"], {
+                    "name": page.name, "path": page.path, "content": page.content,
+                    "content_sha": sha, "received_at": now_iso(),
+                })
+                report.replaced_pages.append(page.page_no)
+            else:
+                self.db.insert("material_pages", {
+                    "id": short_id("page", page_set["id"], page.page_no),
+                    "page_set_id": page_set["id"],
+                    "page_no": page.page_no,
+                    "name": page.name,
+                    "path": page.path,
+                    "content": page.content,
+                    "content_sha": sha,
+                    "received_at": now_iso(),
+                })
+                report.stored_pages.append(page.page_no)
+
+        stored = self._pages_for(page_set["id"])
+        expected_nos = list(range(1, int(page_set["expected_pages"]) + 1))
+        report.received_pages = sorted(stored)
+        report.missing_pages = [n for n in expected_nos if n not in stored]
+        page_set = self._page_set_row(page_set["id"])
+        complete_now = self._page_set_complete(page_set)
+
+        if self._is_stale_version(page_set):
+            # The version this page belongs to is no longer the newest one that
+            # reached completion.  Record it, do not let it replace the active
+            # material or re-run any batch.
+            report.status = "late_page"
+            report.activated = False
+            self._finish_stale_page_set(page_set, complete_now)
+            material_row = self._material_for_version(voyage, slug, version)
+            if material_row is not None:
+                report.material_id = material_row["id"]
+                report.records = self._record_count(material_row["id"])
+            return report
+
+        if not complete_now:
+            report.status = "collecting"
+            report.warnings.append(
+                "waiting for page(s) " + ", ".join(str(n) for n in report.missing_pages)
+            )
+            # The previous complete version stays active; nothing is re-run.
+            return report
+
+        if complete_before and not report.stored_pages and not report.replaced_pages:
+            # A re-send of a complete version is a no-op; the active material
+            # and every batch stay exactly as they were.
+            report.status = "unchanged"
+            material_row = self._material_for_version(voyage, slug, version)
+            if material_row is not None:
+                report.material_id = material_row["id"]
+                report.records = self._record_count(material_row["id"])
+                report.affected_batches = self._batch_keys_for_material(material_row["id"])
+            return report
+
+        # Every page is present: activate this version as one atomic switch.
+        report.activated = True
+        report.status = "activated" if not complete_before else "resubmitted"
+        self._activate_page_set(page_set, report)
+        return report
+
+    def _finish_stale_page_set(self, page_set: dict[str, Any],
+                               complete_now: bool) -> dict[str, Any]:
+        """Mark an older version complete once its last page arrives.
+
+        The version is not activated — a newer version already is — but its
+        assembled rows are extracted so the archive can be inspected and its
+        record keys match the version's own content.  Laboratory rows are keyed
+        globally, so an archived lab version only keeps its text and lets the
+        active version own the rows.
+        """
+        stamp = now_iso()
+        if complete_now:
+            self.db.update("page_sets", page_set["id"], {
+                "status": "complete", "updated_at": stamp,
+            })
+            pages_by_no = self._pages_for(page_set["id"])
+            ordered = [PageInput(page_no=n, name=pages_by_no[n]["name"],
+                                 content=pages_by_no[n]["content"])
+                       for n in sorted(pages_by_no)]
+            content = assemble_text(ordered, int(page_set["expected_pages"]))
+            material = self._material_for_version(
+                page_set["voyage"], page_set["slug"], int(page_set["version"]))
+            if material is None:
+                material_id = short_id("mat", page_set["voyage"], page_set["slug"],
+                                       content_hash(content), f"v{page_set['version']}")
+                self.db.insert("materials", {
+                    "id": material_id,
+                    "slug": page_set["slug"],
+                    "voyage": page_set["voyage"],
+                    "kind": page_set["kind"],
+                    "name": page_set.get("name") or ordered[0].name,
+                    "path": None,
+                    "content": content,
+                    "content_sha": content_hash(content),
+                    "status": "superseded",
+                    "version": int(page_set["version"]),
+                    "imported_at": stamp,
+                    "updated_at": stamp,
+                })
+                self._extract(material_id, page_set["voyage"], page_set["slug"],
+                              page_set.get("name") or ordered[0].name, content,
+                              page_set["kind"], document=assemble_pages(ordered))
+                self.db.execute(
+                    "UPDATE page_sets SET material_id = ? WHERE id = ?",
+                    (material_id, page_set["id"]))
+            elif page_set["kind"] == "lab":
+                # Laboratory rows are global by record key; an archived lab
+                # version must not steal them from the active material.
+                self.db.update("materials", material["id"], {
+                    "content": content, "content_sha": content_hash(content),
+                    "updated_at": stamp,
+                })
+            else:
+                # Archive rows follow the archived content; the active version
+                # and every batch stay untouched.
+                self.db.update("materials", material["id"], {
+                    "content": content, "content_sha": content_hash(content),
+                    "updated_at": stamp,
+                })
+                self._extract(material["id"], page_set["voyage"], page_set["slug"],
+                              material["name"], content, page_set["kind"],
+                              document=assemble_pages(ordered),
+                              replay_corrections=False)
+        return self._page_set_row(page_set["id"])
+
+    def _resolve_page_version(self, voyage: str, slug: str, pages: list[PageInput],
+                              active_version: int) -> int:
+        """Pick the version an upload belongs to when the caller does not say.
+
+        While a version is still being collected, an unlabelled page continues
+        it (so a restart resumes where it stopped) unless it is byte-identical
+        to a page an earlier version already holds, which makes it a re-send of
+        that older version.  Once every version is complete, an identical page
+        is likewise a late page of the old version; a *changed* late page cannot
+        be told apart by content, so passing ``version`` is the unambiguous way
+        to route it.
+        """
+        completed: dict[int, dict[int, str]] = {}
+        for page_set in self.db.fetchall(
+            "SELECT * FROM page_sets WHERE voyage = ? AND slug = ? AND status = 'complete' "
+            "ORDER BY version DESC",
+            (voyage, slug),
+        ):
+            stored = self._pages_for(page_set["id"])
+            completed[int(page_set["version"])] = {
+                n: row["content_sha"] for n, row in stored.items()
+            }
+        # A re-sent identical page always means the version that already holds it.
+        exact = [
+            version for version, hashes in completed.items()
+            if all(hashes.get(p.page_no) == content_hash(p.content) for p in pages)
+        ]
+        if exact:
+            return max(exact)
+
+        newest_complete = max(completed) if completed else 0
+        open_set = self.db.fetchone(
+            "SELECT * FROM page_sets WHERE voyage = ? AND slug = ? "
+            "AND status <> 'complete' ORDER BY version DESC LIMIT 1",
+            (voyage, slug),
+        )
+        if open_set is not None:
+            # An unlabelled page continues the version still being collected.
+            # A delayed *changed* page of an older version cannot be told apart
+            # by content, so it must carry ``version``.
+            return int(open_set["version"])
+        return max(active_version, newest_complete) + 1
+
+    def _create_page_set(self, voyage: str, slug: str, kind: str, version: int,
+                         expected: int, material: MaterialInput,
+                         first: PageInput) -> dict[str, Any]:
+        stamp = now_iso()
+        page_set_id = short_id("pset", voyage, slug, version)
+        self.db.insert("page_sets", {
+            "id": page_set_id,
+            "voyage": voyage,
+            "slug": slug,
+            "version": version,
+            "expected_pages": expected,
+            "format": document_format(first.content, first.name),
+            "kind": kind,
+            "name": material.name or first.name,
+            "status": "collecting",
+            "material_id": None,
+            "page_map": None,
+            "created_at": stamp,
+            "updated_at": stamp,
+        })
+        return self._page_set_row(page_set_id)
+
+    def _page_set_row(self, page_set_id: str) -> dict[str, Any]:
+        row = self.db.fetchone("SELECT * FROM page_sets WHERE id = ?", (page_set_id,))
+        if row is None:
+            raise NotFound(f"page set '{page_set_id}' not found")
+        return row
+
+    def _pages_for(self, page_set_id: str) -> dict[int, dict[str, Any]]:
+        return {
+            int(row["page_no"]): row
+            for row in self.db.fetchall(
+                "SELECT * FROM material_pages WHERE page_set_id = ? ORDER BY page_no",
+                (page_set_id,),
+            )
+        }
+
+    def _page_set_complete(self, page_set: dict[str, Any]) -> bool:
+        if page_set.get("status") == "complete":
+            return True
+        pages = self._pages_for(page_set["id"])
+        return all(n in pages for n in range(1, int(page_set["expected_pages"]) + 1))
+
+    def _is_stale_version(self, page_set: dict[str, Any]) -> bool:
+        """True when a newer page-set version of this material already completed."""
+        row = self.db.fetchone(
+            "SELECT MAX(version) AS v FROM page_sets "
+            "WHERE voyage = ? AND slug = ? AND status = 'complete'",
+            (page_set["voyage"], page_set["slug"]),
+        )
+        newest = int((row or {}).get("v") or 0)
+        return newest > int(page_set["version"])
+
+    def _material_for_version(self, voyage: str, slug: str,
+                              version: int) -> dict[str, Any] | None:
+        return self.db.fetchone(
+            "SELECT * FROM materials WHERE voyage = ? AND slug = ? AND version = ? "
+            "ORDER BY imported_at DESC LIMIT 1",
+            (voyage, slug, version),
+        )
+
+    def _activate_page_set(self, page_set: dict[str, Any], report: PageIngestReport) -> None:
+        voyage, slug, version = page_set["voyage"], page_set["slug"], int(page_set["version"])
+        pages_by_no = self._pages_for(page_set["id"])
+        ordered = [PageInput(page_no=n, name=pages_by_no[n]["name"],
+                             content=pages_by_no[n]["content"])
+                   for n in sorted(pages_by_no)]
+        content = assemble_text(ordered, int(page_set["expected_pages"]))
+        name = page_set.get("name") or ordered[0].name
+        kind = page_set["kind"]
+        sha = content_hash(content)
+        stamp = now_iso()
+
+        existing = self._active_material(voyage, slug)
+        affected: set[str] = set()
+        if kind == "handover":
+            affected |= set(self._batch_keys_for_voyage(voyage))
+        if existing is not None:
+            affected |= set(self._batch_keys_for_material(existing["id"]))
+            self.db.execute(
+                "UPDATE materials SET status = 'superseded', updated_at = ? WHERE id = ?",
+                (stamp, existing["id"]),
+            )
+            if kind == "lab":
+                self._refresh_lab_activity()
+            report.replaced_material_id = existing["id"]
+        elif self._material_for_version(voyage, slug, version) is not None:
+            affected |= set(self._batch_keys_for_material(
+                self._material_for_version(voyage, slug, version)["id"]))
+
+        material_id = short_id("mat", voyage, slug, sha, f"v{version}")
+        self.db.insert("materials", {
+            "id": material_id,
+            "slug": slug,
+            "voyage": voyage,
+            "kind": kind,
+            "name": name,
+            "path": None,
+            "content": content,
+            "content_sha": sha,
+            "status": "active",
+            "version": version,
+            "imported_at": stamp,
+            "updated_at": stamp,
+        })
+        self.db.execute(
+            "UPDATE page_sets SET status = 'complete', material_id = ?, updated_at = ? "
+            "WHERE id = ?", (material_id, stamp, page_set["id"]))
+        # A page set is rendered from separate files, so line numbers refer to
+        # the original page file recorded in each locator.
+        page_map = {str(n): pages_by_no[n]["name"] for n in sorted(pages_by_no)}
+        self.db.execute("UPDATE page_sets SET page_map = ? WHERE id = ?",
+                        (to_json(page_map), page_set["id"]))
+        document = assemble_pages(ordered)
+        extraction = self._extract(material_id, voyage, slug, name, content, kind,
+                                   document=document)
+        report.material_id = material_id
+        report.records = len(extraction.findings)
+        report.warnings.extend(extraction.warnings)
+        if kind == "lab":
+            affected |= self._batch_keys_for_lab(voyage, extraction.findings)
+        if kind == "deck":
+            affected |= self._batch_keys_for_deck(voyage, extraction.findings)
+        if kind == "handover":
+            affected |= {f"{voyage}|{code}" for code in self._handover_codes(extraction.findings)}
+        report.affected_batches = sorted(affected)
+        self._refresh_batches(report.affected_batches)
+
+    def get_page_set(self, slug: str, voyage: str | None = None,
+                     version: int | None = None) -> dict[str, Any]:
+        clauses = ["slug = ?"]
+        params: list[Any] = [slug]
+        if voyage:
+            clauses.append("voyage = ?")
+            params.append(slugify(voyage))
+        if version is not None:
+            clauses.append("version = ?")
+            params.append(version)
+        query = ("SELECT * FROM page_sets WHERE " + " AND ".join(clauses)
+                 + " ORDER BY version DESC, updated_at DESC LIMIT 1")
+        row = self.db.fetchone(query, params)
+        if row is None:
+            raise NotFound(f"page set '{slug}' not found")
+        return self._page_set_public(row)
+
+    def list_page_sets(self, voyage: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM page_sets"
+        params: list[Any] = []
+        if voyage:
+            query += " WHERE voyage = ?"
+            params.append(slugify(voyage))
+        query += " ORDER BY voyage, slug, version DESC"
+        return [self._page_set_public(row) for row in self.db.fetchall(query, params)]
+
+    def _page_set_public(self, row: dict[str, Any]) -> dict[str, Any]:
+        pages = self._pages_for(row["id"])
+        expected = int(row["expected_pages"])
+        return {
+            "id": row["id"],
+            "voyage": row["voyage"],
+            "slug": row["slug"],
+            "kind": row["kind"],
+            "name": row["name"],
+            "version": int(row["version"]),
+            "expected_pages": expected,
+            "status": row["status"],
+            "material_id": row["material_id"],
+            "active": self._is_active_material_id(row.get("material_id")),
+            "page_map": from_json(row.get("page_map"), {}) or {},
+            "received_pages": sorted(pages),
+            "missing_pages": [n for n in range(1, expected + 1) if n not in pages],
+            "pages": [
+                {"page": n, "name": pages[n]["name"], "content_sha": pages[n]["content_sha"],
+                 "received_at": pages[n]["received_at"]}
+                for n in sorted(pages)
+            ],
+        }
+
+    def _is_active_material_id(self, material_id: str | None) -> bool:
+        if not material_id:
+            return False
+        return bool(self.db.scalar(
+            "SELECT 1 FROM materials WHERE id = ? AND status = 'active'", (material_id,), 0))
 
     def _import_one(self, material: MaterialInput, replace: bool, withdraw: bool) -> IngestReport:
         voyage = slugify(material.voyage or DEFAULT_VOYAGE)
@@ -454,10 +976,11 @@ class SamplingService:
     # Extraction and correction replay
     # ==================================================================
     def _extract(self, material_id: str, voyage: str, slug: str, name: str,
-                 content: str, kind: str):
-        document = parse_document(content, name)
+                 content: str, kind: str, document=None, replay_corrections: bool = True):
+        document = document or parse_document(content, name)
         result = EXTRACTORS[kind](document, slug, name)
-        corrections = self._corrections_for({f.record_key for f in result.findings})
+        corrections = (self._corrections_for({f.record_key for f in result.findings})
+                       if replay_corrections else {})
         for finding in result.findings:
             decision = corrections.get(finding.record_key)
             if not decision:
@@ -1198,7 +1721,8 @@ class SamplingService:
         published = len(rows)
         pending = max(0, len(bottles) - published)
         comparison = canonical_json([
-            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"]]
+            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"],
+             row["payload"]]
             for row in rows
         ] + [["__status__", status]])
         latest = self.db.fetchall(
@@ -1206,7 +1730,8 @@ class SamplingService:
             (batch["id"], current_version),
         ) if current_version else []
         latest_comparison = canonical_json([
-            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"]]
+            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"],
+             row["payload"]]
             for row in latest
         ] + [["__status__", batch.get("status")]])
         stamp = now_iso()

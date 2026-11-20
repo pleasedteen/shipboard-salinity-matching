@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import Settings, redact_url
+from .document import PageInput
 from .service import (
     Conflict,
     MaterialInput,
@@ -39,10 +40,13 @@ class Api:
                 "docs": "/api/docs",
                 "endpoints": [
                     "POST /api/materials",
+                    "POST /api/materials/pages",
                     "POST /api/materials/{slug}/revise",
                     "POST /api/materials/{slug}/withdraw",
                     "GET  /api/materials",
                     "GET  /api/materials/{slug}",
+                    "GET  /api/page-sets",
+                    "GET  /api/page-sets/{slug}",
                     "GET  /api/batches",
                     "GET  /api/batches/{batch}",
                     "GET  /api/samples",
@@ -66,6 +70,8 @@ class Api:
 
         if rest and rest[0] == "materials":
             return self._materials(method, rest[1:], query, body)
+        if rest and rest[0] == "page-sets":
+            return self._page_sets(method, rest[1:], query)
         if rest and rest[0] == "batches":
             return self._batches(method, rest[1:], query, body)
         if rest and rest[0] == "samples":
@@ -84,9 +90,19 @@ class Api:
                 )
             }
         if method == "POST" and not rest:
+            page_materials = parse_page_payload(body)
+            if page_materials is not None:
+                reports = self.service.import_pages(page_materials, trigger="api")
+                return 201, {"items": [r.public() for r in reports]}
             materials = parse_material_payload(body)
             replace = truthy(first(query, "replace"))
             reports = self.service.import_materials(materials, replace=replace, trigger="api")
+            return 201, {"items": [r.public() for r in reports]}
+        if method == "POST" and rest == ["pages"]:
+            page_materials = parse_page_payload(body)
+            if page_materials is None:
+                raise ServiceError("'pages' must be a non-empty array")
+            reports = self.service.import_pages(page_materials, trigger="api")
             return 201, {"items": [r.public() for r in reports]}
         if not rest:
             raise ServiceError(f"method {method} not allowed", 405, "method_not_allowed")
@@ -106,6 +122,21 @@ class Api:
             report = self.service.withdraw_material(slug, voyage=voyage)
             return 200, report.public()
         raise NotFound(f"unknown material path '/{'/'.join(rest)}'")
+
+    def _page_sets(self, method: str, rest: list[str],
+                   query: dict[str, list[str]]) -> tuple[int, Any]:
+        if method != "GET":
+            raise ServiceError("method not allowed", 405, "method_not_allowed")
+        voyage = first(query, "voyage")
+        if not rest:
+            return 200, {"items": self.service.list_page_sets(voyage=voyage)}
+        if len(rest) == 1:
+            version = first(query, "version")
+            return 200, self.service.get_page_set(
+                rest[0], voyage=voyage,
+                version=int(version) if version not in (None, "") else None,
+            )
+        raise NotFound(f"unknown page-set path '/{'/'.join(rest)}'")
 
     def _batches(self, method: str, rest: list[str], query: dict[str, list[str]],
                  body: Any) -> tuple[int, Any]:
@@ -180,6 +211,72 @@ def read_body_text(body: Any) -> str | None:
             if isinstance(body.get(key), str):
                 return body[key]
     return None
+
+
+def parse_page_payload(body: Any) -> list[MaterialInput] | None:
+    """Parse a page-wise upload, or return None when this is a whole-material post.
+
+    Accepted shapes::
+
+        {"voyage": "...", "materials": [{"slug": "deck_log", "version": 2,
+            "expected_pages": 4, "pages": [{"page": 1, "name": "p1.txt",
+            "content": "..."}]}]}
+        {"voyage": "...", "slug": "deck_log", "version": 2, "expected_pages": 4,
+         "pages": [{"page": 1, "content": "..."}]}
+    """
+    if not isinstance(body, dict):
+        return None
+    if "materials" in body:
+        items = body.get("materials")
+        if not isinstance(items, list):
+            raise ServiceError("'materials' must be an array")
+        grouped = [item for item in items if isinstance(item, dict) and "pages" in item]
+        if not grouped:
+            return None
+        if len(grouped) != len(items):
+            raise ServiceError("cannot mix page-wise and whole materials in one request")
+        return [_page_material(item, body) for item in items]
+    if "pages" in body:
+        return [_page_material(body, body)]
+    return None
+
+
+def _page_material(item: dict[str, Any], body: dict[str, Any]) -> MaterialInput:
+    pages_raw = item.get("pages")
+    if not isinstance(pages_raw, list) or not pages_raw:
+        raise ServiceError("'pages' must be a non-empty array")
+    pages: list[PageInput] = []
+    for index, raw in enumerate(pages_raw):
+        if not isinstance(raw, dict):
+            raise ServiceError(f"pages[{index}] must be an object")
+        try:
+            page_no = int(raw.get("page"))
+        except (TypeError, ValueError):
+            raise ServiceError(f"pages[{index}] needs an integer 'page'")
+        content = raw.get("content")
+        name = raw.get("name")
+        if content is None and raw.get("path"):
+            content = Path(raw["path"]).read_text(encoding="utf-8")
+            name = name or Path(raw["path"]).name
+        if content is None:
+            raise ServiceError(f"pages[{index}] needs 'content' or 'path'")
+        pages.append(PageInput(page_no=page_no, name=name or f"page-{page_no}",
+                               content=content))
+    version = item.get("version", body.get("version"))
+    expected = item.get("expected_pages", body.get("expected_pages"))
+    slug = item.get("slug")
+    if not slug:
+        raise ServiceError("page-wise upload requires 'slug'")
+    return MaterialInput(
+        name=item.get("name") or slug,
+        content="",
+        kind=item.get("kind") or body.get("kind"),
+        voyage=item.get("voyage") or body.get("voyage") or "default",
+        slug=slug,
+        pages=pages,
+        version=int(version) if version not in (None, "") else None,
+        expected_pages=int(expected) if expected not in (None, "") else None,
+    )
 
 
 def parse_material_payload(body: Any) -> list[MaterialInput]:
@@ -282,6 +379,21 @@ POST /api/materials
          "materials": [{"name": "deck.html", "kind": "deck", "content": "..."}]}
   kind is one of deck | handover | lab; it may be omitted and is then guessed
   from the filename and text. Re-posting identical content is a no-op.
+
+POST /api/materials/pages
+  Body: {"voyage": "KX-26-03",
+         "materials": [{"slug": "deck_log", "version": 2, "expected_pages": 4,
+                        "pages": [{"page": 1, "name": "deck_p1.txt",
+                                   "content": "..."}]}]}
+  Upload one long table as separate page files. Pages may arrive in any order
+  and may be re-sent (identical bytes are a no-op). A version becomes active
+  only when expected_pages are all present; query and review keep using the
+  previous complete version until then. A page for an older version is still
+  stored and reported as late_page, without changing the active version.
+
+GET  /api/page-sets?voyage=...
+GET  /api/page-sets/{slug}?voyage=...&version=2
+  Page collection state: expected, received and missing pages per version.
 
 POST /api/materials/{slug}/revise   Body: {"content": "..."}
   Replaces one material and re-runs only the batches that consume it.

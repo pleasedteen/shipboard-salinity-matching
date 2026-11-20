@@ -12,6 +12,8 @@ from helpers import FIXTURES, FIXTURE_FILES, ServiceTestCase
 
 from app.api import make_server
 
+PAGED = FIXTURES / "paged_deck"
+
 
 class ApiTests(ServiceTestCase):
     def setUp(self) -> None:
@@ -106,6 +108,50 @@ class ApiTests(ServiceTestCase):
         self.assertTrue(report["withdrawn"])
         status, batch = self.call("GET", "/api/batches/KX-2603-F")
         self.assertEqual(batch["status"], "held")
+
+    def test_page_upload_over_http(self) -> None:
+        voyage = "PG-26-01"
+        status, body = self.call("POST", "/api/materials", {"voyage": voyage, "materials": [
+            {"name": "handover.html", "kind": "handover",
+             "content": (PAGED / "handover.html").read_text("utf-8")},
+            {"name": "lab_results.txt", "kind": "lab",
+             "content": (PAGED / "lab_results.txt").read_text("utf-8")},
+        ]})
+        self.assertEqual(status, 201)
+
+        def send(*numbers):
+            return self.call("POST", "/api/materials/pages", {
+                "voyage": voyage, "slug": "deck", "kind": "deck",
+                "version": 1, "expected_pages": 4,
+                "pages": [{"page": n, "name": f"deck_p{n}.txt",
+                           "content": (PAGED / f"deck_p{n}.txt").read_text("utf-8")}
+                          for n in numbers],
+            })
+
+        status, body = send(4, 2)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["items"][0]["status"], "collecting")
+        self.assertEqual(body["items"][0]["missing_pages"], [1, 3])
+        status, sets = self.call("GET", f"/api/page-sets/deck?voyage={voyage}")
+        self.assertEqual(status, 200)
+        self.assertEqual(sets["received_pages"], [2, 4])
+        self.assertFalse(sets["active"])
+
+        status, body = send(2)
+        self.assertEqual(body["items"][0]["unchanged_pages"], [2])
+
+        status, body = send(1, 3)
+        self.assertEqual(body["items"][0]["status"], "activated")
+        status, batches = self.call("GET", f"/api/batches?voyage={voyage}")
+        self.assertEqual({b["batch_code"]: b["status"] for b in batches["items"]},
+                         {"PG-2601-A": "published", "PG-2601-B": "published"})
+        status, samples = self.call("GET", f"/api/samples?voyage={voyage}&batch=PG-2601-B")
+        self.assertEqual(samples["total"], 5)
+        locator = samples["items"][0]["provenance"]["deck"][0]
+        self.assertIn(locator["file"], ("deck_p3.txt", "deck_p4.txt"))
+        status, sets = self.call("GET", f"/api/page-sets/deck?voyage={voyage}")
+        self.assertTrue(sets["active"])
+        self.assertEqual(sets["missing_pages"], [])
 
     def test_errors_are_json(self) -> None:
         status, body = self.call("GET", "/api/batches/nope")

@@ -18,14 +18,22 @@ from helpers import FIXTURES, fixtures
 
 from app.config import Settings
 from app.db import Database
-from app.service import SamplingService
+from app.service import MaterialInput, SamplingService
+
+
+def material_input(name: str, kind: str, voyage: str, **extra) -> MaterialInput:
+    path = FIXTURES / "paged_deck" / name
+    return MaterialInput(name=name, content=path.read_text("utf-8"), kind=kind,
+                         voyage=voyage, **extra)
 
 
 class _Cursor:
-    def __init__(self, cursor):
+    def __init__(self, cursor, issued: list[str]):
         self._cursor = cursor
+        self._issued = issued
 
     def execute(self, query: str, params=()):
+        self._issued.append(query)
         self._cursor.execute(query.replace("%s", "?"), tuple(params))
         return self
 
@@ -56,7 +64,7 @@ class _Connection:
         self.issued: list[str] = []
 
     def cursor(self):
-        return _Cursor(self._conn.cursor())
+        return _Cursor(self._conn.cursor(), self.issued)
 
     def commit(self):
         self._conn.commit()
@@ -118,6 +126,33 @@ class PostgresDialectTests(unittest.TestCase):
             for query in connection.issued:
                 self.assertNotIn("?", query)
             self.assertNotIn("?", str(connection.issued))
+
+    def test_page_collection_over_postgres_path(self) -> None:
+        from app.document import PageInput
+
+        paged = FIXTURES / "paged_deck"
+        service = SamplingService(settings=Settings(
+            database_url="postgresql://tester@localhost/sampling",
+            fixture_dir=paged,
+        ))
+        self.addCleanup(service.db.close)
+        voyage = "PG-26-01"
+        service.import_materials([
+            material_input("handover.html", "handover", voyage),
+            material_input("lab_results.txt", "lab", voyage),
+        ])
+        for number in (3, 1, 2, 4):
+            report = service.import_pages([MaterialInput(
+                name="deck", content="", kind="deck", voyage=voyage, slug="deck",
+                expected_pages=4,
+                pages=[PageInput(number, f"deck_p{number}.txt",
+                                 (paged / f"deck_p{number}.txt").read_text("utf-8"))],
+            )])[0]
+        self.assertEqual(report.status, "activated")
+        self.assertEqual(service.get_page_set("deck", voyage=voyage)["missing_pages"], [])
+        self.assertEqual(service.query_samples(voyage=voyage)["total"], 10)
+        for connection in self.connections:
+            self.assertEqual([q for q in connection.issued if "?" in q], [])
 
     def test_missing_driver_raises_actionable_error(self) -> None:
         sys.modules.pop("psycopg", None)

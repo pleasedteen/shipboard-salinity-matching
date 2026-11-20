@@ -276,10 +276,11 @@ def _row_excerpt(texts: list[str]) -> str:
 
 
 def _locator(material_slug: str, material_name: str, section: str, page: int | None,
-             line: int | None, row: int | None, excerpt_text: str) -> dict[str, Any]:
+             line: int | None, row: int | None, excerpt_text: str,
+             file: str | None = None) -> dict[str, Any]:
     loc = {
         "material": material_slug,
-        "file": material_name,
+        "file": file or material_name,
         "section": section,
         "page": page,
         "line": line,
@@ -368,6 +369,11 @@ def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str) ->
     seen: set[str] = set()
 
     for event in doc.events:
+        if event.page is not None:
+            # Pages uploaded separately carry their own number; a printed
+            # "第 N 页" marker still wins when it is present.  The section
+            # heading is left in place so page 2 inherits page 1's scope.
+            page = event.page
         if event.type in ("heading", "paragraph"):
             text = event.text
             page_hint = page_number(text)
@@ -449,7 +455,7 @@ def extract_deck(doc: ParsedDocument, material_slug: str, material_name: str) ->
             ordinal += 1
             in_scope = sum(1 for f in result.findings if f.fields.get("station") == station)
             loc = _locator(material_slug, material_name, current_section, page, row.line,
-                           in_scope, _row_excerpt(texts))
+                           in_scope, _row_excerpt(texts), file=event.file)
             finding = ExtractFinding(
                 kind="deck",
                 record_key="",
@@ -510,6 +516,11 @@ def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str
     seen: set[str] = set()
 
     for event in doc.events:
+        if event.page is not None:
+            # Pages uploaded separately carry their own number; a printed
+            # "第 N 页" marker still wins when it is present.  The section
+            # heading is left in place so page 2 inherits page 1's scope.
+            page = event.page
         if event.type in ("heading", "paragraph"):
             text = event.text
             page_hint = page_number(text)
@@ -582,7 +593,7 @@ def extract_handover(doc: ParsedDocument, material_slug: str, material_name: str
 
             ordinal += 1
             loc = _locator(material_slug, material_name, current_section, page, row.line,
-                           ordinal - 1, _row_excerpt(texts))
+                           ordinal - 1, _row_excerpt(texts), file=event.file)
             finding = ExtractFinding(
                 kind="handover",
                 record_key="",
@@ -644,6 +655,11 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
     seen: set[str] = set()
 
     for event in doc.events:
+        if event.page is not None:
+            # Pages uploaded separately carry their own number; a printed
+            # "第 N 页" marker still wins when it is present.  The section
+            # heading is left in place so page 2 inherits page 1's scope.
+            page = event.page
         if event.type in ("heading", "paragraph"):
             text = event.text
             page_hint = page_number(text)
@@ -738,7 +754,7 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
 
             ordinal += 1
             loc = _locator(material_slug, material_name, current_section, page, row.line,
-                           ordinal - 1, _row_excerpt(texts))
+                           ordinal - 1, _row_excerpt(texts), file=event.file)
             finding = ExtractFinding(
                 kind="lab",
                 record_key="",

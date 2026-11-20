@@ -36,12 +36,25 @@ class Event:
     line: int = 1
     level: int = 0
     rows: list[GridRow] = field(default_factory=list)
+    # Set when a document is assembled from separately uploaded pages: the
+    # logical page number and the original page file.  ``line`` then counts
+    # lines inside that file, so a finding can point at page file + line.
+    page: int | None = None
+    file: str | None = None
 
 
 @dataclass
 class ParsedDocument:
     events: list[Event]
     format: str
+
+
+@dataclass
+class PageInput:
+    page_no: int
+    name: str
+    content: str
+    path: str | None = None
 
 
 def _grid(rows: list[dict]) -> list[GridRow]:
@@ -358,6 +371,52 @@ def parse_document(text: str, name: str = "") -> ParsedDocument:
     else:
         doc = merge_adjacent_text_tables(parse_text(text))
     return doc
+
+
+def document_format(text: str, name: str = "") -> str:
+    if re.search(r"<html|<table|<tr\b|<body|<!doctype", text, re.I) or name.lower().endswith((".html", ".htm")):
+        return "html"
+    return "text"
+
+
+def assemble_pages(pages: list[PageInput]) -> ParsedDocument:
+    """Parse separately uploaded pages into one continuous event stream.
+
+    Each page is parsed on its own so every event keeps the file and line it
+    came from, then the events are concatenated in page order.  State that the
+    extractors carry across events (governing station, date, column header)
+    therefore flows from a page into its continuation page exactly as it does
+    inside a single printed document.
+    """
+    events: list[Event] = []
+    fmt = "text"
+    ordered = sorted(pages, key=lambda p: p.page_no)
+    for index, page in enumerate(ordered):
+        doc = parse_document(page.content, page.name)
+        if index == 0:
+            fmt = doc.format
+        for event in doc.events:
+            event.page = page.page_no
+            event.file = page.name
+            events.append(event)
+    return ParsedDocument(events=events, format=fmt)
+
+
+def assemble_text(pages: list[PageInput], expected_pages: int | None = None) -> str:
+    """Human-readable rendering stored as the material's ``content``.
+
+    The page marker is informational: extraction works from the per-page event
+    stream, and locators point at the original page file and its line numbers.
+    """
+    total = expected_pages or len(pages)
+    ordered = sorted(pages, key=lambda p: p.page_no)
+    parts: list[str] = []
+    for page in ordered:
+        text = page.content.strip()
+        if not re.match(r"第\s*\d+\s*页", text):
+            text = f"第 {page.page_no} 页 / 共 {total} 页\n{text}"
+        parts.append(text)
+    return "\n\n".join(parts) + "\n"
 
 
 def page_number(text: str) -> int | None:
