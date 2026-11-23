@@ -203,11 +203,33 @@ SCHEMA: tuple[str, ...] = (
         id TEXT PRIMARY KEY,
         trigger TEXT NOT NULL,
         status TEXT NOT NULL,
+        seq INTEGER NOT NULL DEFAULT 0,
+        phase TEXT,
+        current_material TEXT,
+        last_completed_material TEXT,
+        materials_total INTEGER NOT NULL DEFAULT 0,
+        materials_done INTEGER NOT NULL DEFAULT 0,
+        batches_total INTEGER NOT NULL DEFAULT 0,
+        batches_done INTEGER NOT NULL DEFAULT 0,
         started_at TEXT NOT NULL,
         finished_at TEXT,
         summary TEXT
     )
     """,
+)
+
+# Columns added after the first release.  ``CREATE TABLE IF NOT EXISTS`` does
+# not alter an existing table, and the production store may already hold rows,
+# so they are added in place.  Each entry is (table, column, declaration).
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("runs", "phase", "TEXT"),
+    ("runs", "seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "current_material", "TEXT"),
+    ("runs", "last_completed_material", "TEXT"),
+    ("runs", "materials_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "materials_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "batches_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "batches_done", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -297,6 +319,57 @@ class Database:
             cur.close()
             return [dict(zip(names, row)) for row in rows]
 
+    def busy(self) -> bool:
+        """True while this process holds an open write transaction."""
+        return self._depth > 0
+
+    def write_lock_free(self) -> bool:
+        """Whether another process is currently holding the write lock.
+
+        Only meaningful for SQLite, where a competing importer blocks writers.
+        PostgreSQL serialises writers itself, so the answer is always "free"
+        and the caller proceeds normally.
+        """
+        if not self.is_sqlite or self._conn is None:
+            return True
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA busy_timeout=0")
+                self._conn.execute("BEGIN IMMEDIATE")
+            except Exception:
+                return False
+            finally:
+                try:
+                    self._conn.execute("PRAGMA busy_timeout=30000")
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            self._conn.rollback()
+            return True
+
+    def try_fetchall(self, query: str, params: Iterable[Any] = (),
+                     timeout: float = 0.05) -> list[dict[str, Any]] | None:
+        """Best-effort read that never waits for a rival writer.
+
+        Returns ``None`` when another thread currently holds the connection
+        (typically an import transaction in flight).  Callers that must stay
+        responsive use this to serve their own live view instead of blocking.
+        """
+        if not self._lock.acquire(timeout=timeout):
+            return None
+        try:
+            cur = self._execute(query, params)
+            rows = cur.fetchall()
+            names = [d[0] for d in cur.description]
+            cur.close()
+            return [dict(zip(names, row)) for row in rows]
+        except Exception:
+            # A rival transaction on the same connection (or a locked
+            # database) must degrade to the caller's live fallback, never
+            # surface as an error on a status query.
+            return None
+        finally:
+            self._lock.release()
+
     def fetchone(self, query: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
         rows = self.fetchall(query, params)
         return rows[0] if rows else None
@@ -361,7 +434,33 @@ class Database:
             with self.transaction():
                 for statement in SCHEMA:
                     self._execute(statement)
+                self._migrate()
             self._schema_ready = True
+
+    def _migrate(self) -> None:
+        for table, column, declaration in MIGRATIONS:
+            if not self._has_column(table, column):
+                self._execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _has_column(self, table: str, column: str) -> bool:
+        if self.is_sqlite:
+            return self._sqlite_has_column(table, column)
+        try:
+            row = self.fetchone(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ? AND column_name = ?",
+                (table, column),
+            )
+        except Exception:  # pragma: no cover - only the SQLite-backed test shim
+            # The PostgreSQL code path is exercised in tests by a driver shim
+            # over SQLite, which has no information_schema.  A live server
+            # always has it, so the fallback is only for that shim.
+            return self._sqlite_has_column(table, column)
+        return row is not None
+
+    def _sqlite_has_column(self, table: str, column: str) -> bool:
+        rows = self.fetchall(f"PRAGMA table_info({table})")
+        return any(row["name"] == column for row in rows)
 
     def ping(self) -> bool:
         row = self.fetchone("SELECT 1 AS ok")

@@ -46,6 +46,7 @@ python3 run.py import --database sqlite:///var/sampling.db \
 
 ```bash
 python3 run.py batches --voyage KX-26-03
+python3 run.py runs --limit 5
 python3 run.py query   --batch KX-2603-A
 python3 run.py review  --status open
 ```
@@ -123,6 +124,19 @@ POST /api/materials/{slug}/withdraw
 - 撤回实验室报告 → 依赖它的批次转 `held`；其他批次照常。
 - 撤回交接单 → 该交接单划定的批次转为 `held`，其余批次照常。
 
+### 导入运行
+
+```
+GET /api/runs
+GET /api/runs/{run_id}
+```
+
+每条运行给出 `status`、`phase`（`started` / `materials` / `batches` / `completed` / `failed` / `interrupted`）及中文 `phase_label`、`current_material`（正在摄取的材料）、`last_completed_material`（最近处理完的材料）、`materials_done`/`materials_total`、`batches_done`/`batches_total`。
+
+- 导入进行中即可查询：运行位置写在一份旁路记录里，不随导入事务回滚，也不等待主库写锁。
+- 失败（`failed`）与中断（`interrupted`）都带 `stopped_at`，指出停在哪个环节、哪份材料最近处理完；样表与复核队列保持导入前状态。
+- 完成状态与数据在同一事务提交：调用方没收到响应而被杀掉，重启后该次运行仍为 `completed`，重跑为幂等 no-op。
+
 ### 查询
 
 ```
@@ -154,6 +168,8 @@ GET /api/samples?voyage=KX-26-03&batch=KX-2603-A&station=S01&label=S01-001
 批量：
 
 ```
+GET /api/runs                      # 导入进度：status / phase / 最近处理完的材料
+GET /api/runs/{run_id}
 GET /api/batches?voyage=KX-26-03&status=held
 GET /api/batches/{batch_id 或 batch_code}
 GET /api/materials?voyage=KX-26-03&history=true
@@ -236,8 +252,10 @@ python3 run.py serve --host 0.0.0.0 --port 8080
 
 - 启动时自动建表（幂等）。
 - SQL 只使用 `?` 占位符书写，PostgreSQL 模式下自动翻译为 `%s`；不依赖 SQLite 专有函数。
-- 所有写操作在事务中执行；导入中途失败会整体回滚，并留下 `runs` 记录（状态 `failed`）。
-- 进程启动时会把遗留的 `running` 运行标记为 `interrupted`，因此中断后可直接重跑。
+- 所有写操作在事务中执行；导入中途失败会整体回滚，并留下 `runs` 记录（状态 `failed`，附停下时的环节与材料）。
+- 导入分「摄取材料」「更新批次」两个环节；`GET /api/runs` 在导入进行中即可返回当前环节与最近处理完的材料，不必等整批提交。
+- 进度写在主库之外的一份旁路记录里（SQLite 下为数据库旁的 `*.progress.json`，PostgreSQL 下可用 `SAMPLING_PROGRESS_FILE` 指定），因此导入事务回滚不会抹掉「停在哪里」。
+- 进程启动时会把遗留的 `running` 运行标记为 `interrupted`，并保留停下时的环节/材料；因为完成状态与数据在同一个事务里提交，已提交的导入即使没来得及回应调用方，重启后仍显示 `completed`。中断后样表与复核队列保持导入前状态，直接重跑即可。
 
 本机没有 PostgreSQL 时，`tests/test_postgres_path.py` 用一个只接受 `%s` 的假驱动完整跑通导入—查询—复核流程，确保生产路径的 SQL 与事务写法可用；真实环境仍建议做一次连库烟测：
 
@@ -250,9 +268,39 @@ python3 run.py --database "$DATABASE_URL" import --fixtures fixtures --voyage KX
 ## 7. 测试与夹具
 
 ```bash
-python3 verify.py                        # 全部测试 + 走查（约 7–8 秒，远低于 80 秒）
+python3 verify.py                        # 全部测试 + 走查（约 8–9 秒，远低于 80 秒）
 python3 -m unittest discover -s tests -t tests -v
 ```
+
+### 用本地夹具暂停并打断一次导入
+
+`tests/test_run_progress.py` 用夹具完整复现这个流程；也可以手动做一次，只看服务本身的行为：
+
+```bash
+# 1) 一个进程导入，并在「更新批次」环节暂停（等待 marker 被删除）
+rm -f /tmp/pause.json
+SAMPLING_PAUSE_POINT=batches SAMPLING_PAUSE_MARKER=/tmp/pause.json \
+SAMPLING_PAUSE_TIMEOUT=120 \
+python3 run.py --database sqlite:///var/sampling.db import \
+    --fixtures fixtures --voyage KX-26-03 &
+
+# 2) 从另一个进程查询进度：应显示 phase=batches 与最近处理完的材料
+python3 run.py --database sqlite:///var/sampling.db runs
+
+# 3) 直接 kill -9 第一步的进程（不要删 marker），再重启查询：
+#    运行显示 interrupted，stopped_at 给出停下的环节与材料；
+#    batches / samples 保持导入前状态（第一次导入时为空）。
+kill -9 %1
+python3 run.py --database sqlite:///var/sampling.db runs
+python3 run.py --database sqlite:///var/sampling.db batches
+
+# 4) 直接重跑，得到与一次成功导入相同的批次状态
+python3 run.py --database sqlite:///var/sampling.db import \
+    --fixtures fixtures --voyage KX-26-03
+python3 run.py --database sqlite:///var/sampling.db batches
+```
+
+暂停点取值：`materials`（材料阶段开始）、`material-start`（开始摄取某份材料前）、`material`（每份材料处理完）、`batches`（进入批次更新）、`batch`（每个批次重算后）、`before-commit`（提交前）、`after-commit`（已提交但尚未返回调用方）。`SAMPLING_FAIL_POINT` 可让同一位置抛出异常以验证回滚。
 
 夹具（`fixtures/`）覆盖题目要求的各种材料特征，且无需访问外部站点：
 
@@ -284,9 +332,10 @@ app/
   document.py   HTML / 文本 → 统一事件流（标题/段落/表格，含 colspan/rowspan）
   extract.py    三类材料的抽取、栏名同义词、翻页续写、页码与置信度
   matching.py   瓶签/站次/时段兼容性、完美匹配、候选集与语义指纹
+  progress.py   导入运行的旁路进度（跨进程可见、不随事务回滚）
   service.py    导入、批次解析、版本发布、复核决定、查询
   api.py        stdlib HTTP 服务与 JSON 接口
-run.py          命令行入口（serve / import / revise / withdraw / query / review …）
+run.py          命令行入口（serve / import / revise / withdraw / batches / runs / query / review …）
 verify.py       一条命令完成验证
 fixtures/       材料夹具
 tests/          自动化测试（标准库 unittest）

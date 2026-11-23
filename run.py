@@ -97,6 +97,16 @@ def cmd_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_runs(args: argparse.Namespace) -> int:
+    service = service_for(args)
+    if args.run:
+        print(json.dumps(service.get_run(args.run), ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({"items": service.list_runs(limit=args.limit)},
+                         ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_query(args: argparse.Namespace) -> int:
     service = service_for(args)
     out = service.query_samples(
@@ -126,44 +136,59 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Research-vessel sampling importer")
-    parser.add_argument("--database", help="sqlite:///path or postgresql://...")
-    parser.add_argument("--fixtures", help="fixture directory")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # ``--database``/``--fixtures`` are accepted before or after the
+    # subcommand; the README examples use both spellings.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--database", default=argparse.SUPPRESS,
+                        help="sqlite:///path or postgresql://...")
+    common.add_argument("--fixtures", default=argparse.SUPPRESS,
+                        help="fixture directory")
+    parser.add_argument("--database", help=argparse.SUPPRESS)
+    parser.add_argument("--fixtures", help=argparse.SUPPRESS)
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("serve", help="run the HTTP API")
+    def add(name: str, help_text: str) -> argparse.ArgumentParser:
+        return subparsers.add_parser(name, help=help_text, parents=[common])
+
+    p = add("serve", "run the HTTP API")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("import", help="import materials from files")
+    p = add("import", "import materials from files")
     p.add_argument("paths", nargs="*")
     p.add_argument("--voyage", default="default")
     p.add_argument("--kind", choices=["deck", "handover", "lab"])
     p.add_argument("--replace", action="store_true")
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("revise", help="replace one material")
+    p = add("revise", "replace one material")
     p.add_argument("slug")
     p.add_argument("--file", required=True)
     p.add_argument("--voyage")
     p.add_argument("--kind", choices=["deck", "handover", "lab"])
     p.set_defaults(func=cmd_revise)
 
-    p = sub.add_parser("withdraw", help="withdraw one material")
+    p = add("withdraw", "withdraw one material")
     p.add_argument("slug")
     p.add_argument("--voyage")
     p.set_defaults(func=cmd_withdraw)
 
-    p = sub.add_parser("batches", help="list batches")
+    p = add("batches", "list batches")
     p.add_argument("--voyage")
     p.add_argument("--status")
     p.set_defaults(func=cmd_batches)
 
-    p = sub.add_parser("batch", help="show one batch")
+    p = add("batch", "show one batch")
     p.add_argument("batch")
     p.set_defaults(func=cmd_batch)
 
-    p = sub.add_parser("query", help="query published samples")
+    p = add("runs", "list import runs and their positions")
+    p.add_argument("run", nargs="?", help="run id for a single run")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_runs)
+
+    p = add("query", "query published samples")
     p.add_argument("--voyage")
     p.add_argument("--batch")
     p.add_argument("--station")
@@ -173,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--offset", type=int, default=0)
     p.set_defaults(func=cmd_query)
 
-    p = sub.add_parser("review", help="list or resolve review items")
+    p = add("review", "list or resolve review items")
     p.add_argument("--status", default="open")
     p.add_argument("--batch")
     p.add_argument("--voyage")

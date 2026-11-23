@@ -121,6 +121,20 @@ def demo() -> str:
             lines.append(
                 "   - " + ", ".join(f"{r.name}:{r.status}" for r in again)
             )
+
+            lines.append("")
+            lines.append("7. Import runs")
+            runs = service.list_runs()
+            run = next((r for r in runs if r["batches_total"]), runs[0])
+            lines.append(
+                f"   - run {run['id']}: {run['status']} / {run['phase_label']} "
+                f"({run['materials_done']}/{run['materials_total']} materials, "
+                f"{run['batches_done']}/{run['batches_total']} batches)"
+            )
+            lines.append(
+                "   - a stalled or killed import shows the stage and the last "
+                "finished material under stopped_at; the tables keep the "
+                "pre-import state (covered by tests/test_run_progress.py)")
         finally:
             service.db.close()
     return "\n".join(lines)

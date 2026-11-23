@@ -50,6 +50,7 @@ class Api:
                     "GET  /api/review/{item_id}",
                     "POST /api/review/{item_id}/decide",
                     "GET  /api/runs",
+                    "GET  /api/runs/{run_id}",
                     "GET  /api/stats",
                 ],
             }
@@ -62,7 +63,13 @@ class Api:
         if rest == ["stats"]:
             return 200, self.service.stats()
         if rest == ["runs"]:
-            return 200, {"items": self.service.list_runs()}
+            items = self.service.list_runs()
+            return 200, {
+                "items": items,
+                "active": [r for r in items if r["status"] == "running"],
+            }
+        if len(rest) == 2 and rest[0] == "runs":
+            return 200, self.service.get_run(rest[1])
 
         if rest and rest[0] == "materials":
             return self._materials(method, rest[1:], query, body)
@@ -306,6 +313,13 @@ POST /api/review/{item_id}/decide
   {"action": "confirm", "value": {"pairs": [{"bottle": "...", "result": "..."}]}}
   For a low_confidence_extraction item:
   {"action": "correct", "value": {"fields": {"label_raw": "S07-003"}}}
+GET  /api/runs
+  Recent imports. Each item carries status, phase, current_material,
+  last_completed_material, materials_done/materials_total and
+  batches_done/batches_total. While an import is running the live position is
+  returned; after a crash the item shows where it stopped (status
+  "interrupted", with stopped_at) and the sample tables are unchanged.
+GET  /api/runs/{run_id}
 GET  /api/stats
 """
 

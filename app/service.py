@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 import hashlib
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -11,6 +14,13 @@ from .config import Settings
 from .db import Database
 from .document import parse_document
 from .extract import EXTRACTORS, guess_kind
+from .progress import (
+    PHASE_LABELS,
+    ProgressStore,
+    progress_path_for,
+    wait_for_genuine_marker,
+    write_marker,
+)
 from .util import (
     canonical_json,
     from_json,
@@ -25,6 +35,11 @@ from .util import (
 )
 
 KINDS = ("deck", "handover", "lab")
+
+# The import currently running, so deep helpers can report progress without
+# every one of them taking a run id parameter.
+_ACTIVE_RUN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "sampling_active_run", default=None)
 DEFAULT_VOYAGE = "default"
 
 # A laboratory row without its own batch hint is linked to a batch when its
@@ -196,19 +211,171 @@ def _normalise_corrected(fields: dict[str, Any]) -> dict[str, Any]:
 class SamplingService:
     def __init__(self, db: Database | None = None, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
+        self.progress = ProgressStore(progress_path_for(self.settings.database_url))
         self.db = db or Database(self.settings.database_url)
+        if not self.db.write_lock_free():
+            # A separate process is importing.  Do not block its write
+            # transaction, and do not mistake its uncommitted rows for state:
+            # this instance starts read-only-ish and the schema is ensured
+            # when the first write actually happens.
+            self._schema_pending = True
+        else:
+            self.db.ensure_schema()
+            self._schema_pending = False
+        self._paused_points: set[str] = set()
+        self._batch_sweep = False
+        if not self._schema_pending:
+            self._recover_runs()
+
+    def _ensure_writable(self) -> None:
+        """Bring the schema up to date before the first write in this process."""
+        if self._schema_pending:
+            self.db.ensure_schema()
+            self._schema_pending = False
+            self._recover_runs()
+
+    def _ensure_readable(self) -> None:
+        """Ensure the schema before a read, once the writer has let go.
+
+        A process started while another held the write lock skips schema
+        setup; it retries here as soon as the lock is free, which also settles
+        any run that process left ``running``.
+        """
+        if not self._schema_pending or self.db.busy():
+            return
+        if not self.db.write_lock_free():
+            return
         self.db.ensure_schema()
+        self._schema_pending = False
         self._recover_runs()
 
     # ==================================================================
     # Runs (resumability / observability)
     # ==================================================================
     def _recover_runs(self) -> None:
-        with self.db.transaction():
-            self.db.execute(
-                "UPDATE runs SET status = 'interrupted', finished_at = ? WHERE status = 'running'",
-                (now_iso(),),
+        """Close out runs that were left ``running`` by an earlier process.
+
+        The run's completion is written inside the data transaction, so a
+        ``running`` row is always one whose data was *not* committed: the
+        sample/batch/review tables still hold the pre-import state.  Such a
+        run is marked ``interrupted`` and keeps the phase and material it had
+        reached, taken from the sidecar when the process died too fast to
+        write it to the row.
+        """
+        self.progress.refresh()
+        stale = self.db.fetchall(
+            "SELECT * FROM runs WHERE status = 'running'"
+        )
+        stale_ids = {row["id"] for row in stale}
+        # A sidecar entry from an earlier process may claim to be running even
+        # though its row is already completed (a kill after the commit, before
+        # the response).  Align it with the durable row so the file never
+        # advertises a run that is over.
+        for live in self.progress.active():
+            if live["id"] in stale_ids:
+                continue
+            row = self.db.fetchone(
+                "SELECT status, phase FROM runs WHERE id = ?", (live["id"],)
             )
+            if row is None:
+                self.progress.drop(live["id"])
+            elif row["status"] != "running":
+                self.progress.retain(live["id"], {
+                    **live, "status": row["status"], "phase": row["phase"],
+                    "current_material": None,
+                })
+        if not stale:
+            return
+        stamp = now_iso()
+        with self.db.transaction():
+            for row in stale:
+                sidecar = self.progress.get(row["id"]) or {}
+
+                def pick(key: str, default: Any = None) -> Any:
+                    value = sidecar.get(key)
+                    return row.get(key) if value is None else value
+
+                stopped = {
+                    "phase": pick("phase"),
+                    "current_material": pick("current_material"),
+                    "last_completed_material": pick("last_completed_material"),
+                }
+                stopped["phase_label"] = PHASE_LABELS.get(
+                    stopped["phase"], stopped["phase"])
+                self.db.update("runs", row["id"], {
+                    "status": "interrupted",
+                    "phase": "interrupted",
+                    "current_material": None,
+                    "last_completed_material": stopped["last_completed_material"],
+                    "materials_total": int(pick("materials_total") or 0),
+                    "materials_done": int(pick("materials_done") or 0),
+                    "batches_total": int(pick("batches_total") or 0),
+                    "batches_done": int(pick("batches_done") or 0),
+                    "finished_at": stamp,
+                    # Keep phase/current material for the API to read; the
+                    # public layer derives stopped_at from the summary.
+                    "summary": to_json({
+                        "stopped_at": stopped,
+                        "recovered_at_startup": True,
+                    }),
+                })
+                self.progress.retain(row["id"], {
+                    "id": row["id"],
+                    "seq": int(row.get("seq") or 0),
+                    "trigger": row["trigger"],
+                    "status": "interrupted",
+                    "finished_at": stamp,
+                    "phase": stopped["phase"],
+                    "phase_label": stopped["phase_label"],
+                    "current_material": stopped["current_material"],
+                    "last_completed_material": stopped["last_completed_material"],
+                    "materials_total": int(pick("materials_total") or 0),
+                    "materials_done": int(pick("materials_done") or 0),
+                    "batches_total": int(pick("batches_total") or 0),
+                    "batches_done": int(pick("batches_done") or 0),
+                    "started_at": row.get("started_at"),
+                    "updated_at": stamp,
+                    "summary": to_json({
+                        "stopped_at": stopped,
+                        "recovered_at_startup": True,
+                    }),
+                })
+
+    # -- progress plumbing ----------------------------------------------
+    def _pause_hook(self, point: str, run_id: str | None = None) -> None:
+        """Test hook: block at a named point so a harness can observe/kill.
+
+        Enabled only when ``SAMPLING_PAUSE_POINT`` names this point.  The
+        marker file ``SAMPLING_PAUSE_MARKER`` is written (with the live run
+        position) so the harness knows the process really reached the point,
+        and the import waits until the marker is deleted or
+        ``SAMPLING_PAUSE_TIMEOUT`` seconds pass.
+        """
+        if os.environ.get("SAMPLING_PAUSE_POINT") != point:
+            return
+        if point in self._paused_points:
+            return
+        self._paused_points.add(point)
+        marker = Path(os.environ.get("SAMPLING_PAUSE_MARKER", "sampling-pause.json"))
+        record = self.progress.get(run_id) if run_id else None
+        token = f"{os.getpid()}:{time.time_ns()}"
+        write_marker(marker, {
+            "token": token,
+            "point": point,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "position": record,
+        })
+        timeout = float(os.environ.get("SAMPLING_PAUSE_TIMEOUT", "120"))
+        wait_for_genuine_marker(marker, token, timeout)
+
+    def _fail_point(self, point: str, run_id: str) -> None:
+        """Test hook: raise at a named point to prove the rollback path."""
+        if os.environ.get("SAMPLING_FAIL_POINT") == point:
+            raise RuntimeError(f"simulated failure at '{point}' (run {run_id})")
+
+    def _progress_update(self, run_id: str, **fields: Any) -> None:
+        self.progress.update(run_id, **fields)
 
     # ==================================================================
     # Material ingestion
@@ -223,6 +390,7 @@ class SamplingService:
         items = list(materials)
         if not items:
             return []
+        self._ensure_writable()
         run_seq = self.db.scalar("SELECT COUNT(*) FROM runs", (), 0)
         run_id = short_id("run", now_iso(), trigger, len(items), run_seq)
         with self.db.transaction():
@@ -230,26 +398,131 @@ class SamplingService:
                 "id": run_id,
                 "trigger": trigger,
                 "status": "running",
+                "seq": run_seq,
+                "phase": "started",
+                "materials_total": len(items),
                 "started_at": now_iso(),
                 "summary": None,
             })
+        self.progress.start(run_id, trigger, len(items), seq=run_seq)
+        # Deliberately outside the data transaction: a run whose position can
+        # only be seen after the import commits would not tell a caller where
+        # an interrupted import stopped.
         try:
             with self.db.transaction():
-                reports = [self._import_one(m, replace=replace, withdraw=withdraw)
-                           for m in items]
+                self._progress_update(run_id, phase="materials")
+                self._pause_hook("materials", run_id)
+                reports: list[IngestReport] = []
+                for index, item in enumerate(items, start=1):
+                    self._progress_update(
+                        run_id, current_material=item.name,
+                        materials_done=index - 1,
+                    )
+                    self._pause_hook("material-start", run_id)
+                    token = _ACTIVE_RUN.set(run_id)
+                    try:
+                        reports.append(self._import_one(
+                            item, replace=replace, withdraw=withdraw, run_id=run_id,
+                        ))
+                    finally:
+                        _ACTIVE_RUN.reset(token)
+                    self._progress_update(
+                        run_id, last_completed_material=item.name,
+                        current_material=None, materials_done=index,
+                    )
+                    self._pause_hook("material", run_id)
+                self._fail_point("materials", run_id)
+
+                self._progress_update(run_id, phase="batches")
+                affected = sorted({key for r in reports for key in r.affected_batches})
+                voyages = {key.split("|", 1)[0] if "|" in key else DEFAULT_VOYAGE
+                           for key in affected}
+                self._progress_update(
+                    run_id,
+                    batches_total=sum(len(self._batches_in_voyage(v)) for v in voyages),
+                    batches_done=0,
+                )
+                self._pause_hook("batches", run_id)
+                token = _ACTIVE_RUN.set(run_id)
+                self._batch_sweep = True
+                try:
+                    self._refresh_batches(affected)
+                finally:
+                    self._batch_sweep = False
+                    _ACTIVE_RUN.reset(token)
+                self._fail_point("batches", run_id)
+                self._pause_hook("before-commit", run_id)
+
+                # The run's own bookkeeping is written in the *same*
+                # transaction as the data.  Committing therefore means both
+                # are durable: an import reported as completed cannot have
+                # rolled back, and one killed before the commit leaves the
+                # run row untouched (recovered as interrupted at startup).
+                snapshot = self.progress.get(run_id) or {}
                 self.db.update("runs", run_id, {
                     "status": "completed",
+                    "phase": "completed",
+                    "current_material": None,
+                    "last_completed_material": snapshot.get("last_completed_material"),
+                    "materials_total": len(items),
+                    "materials_done": len(items),
+                    "batches_total": snapshot.get("batches_total", 0),
+                    "batches_done": snapshot.get("batches_done", 0),
                     "finished_at": now_iso(),
                     "summary": to_json([r.public() for r in reports]),
                 })
+            # The import is durable at this point.  A caller that never
+            # receives the response still finds the run completed after a
+            # restart; this pause exists only for the harness to prove it.
+            self._pause_hook("after-commit", run_id)
+            snapshot = self.progress.get(run_id) or {}
+            self.progress.finish(run_id, "completed",
+                                 summary=[r.public() for r in reports])
+            self.progress.update(
+                run_id,
+                materials_total=len(items), materials_done=len(items),
+                batches_total=snapshot.get("batches_total", 0),
+                batches_done=snapshot.get("batches_done", 0),
+                last_completed_material=snapshot.get("last_completed_material"),
+                finished_at=snapshot.get("finished_at") or now_iso(),
+            )
             return reports
         except BaseException as exc:
+            # The data transaction has rolled back by now; record the failure
+            # in its own transaction so the run row survives.
+            snapshot = self.progress.get(run_id) or {}
             with self.db.transaction():
                 self.db.update("runs", run_id, {
                     "status": "failed",
+                    "phase": "failed",
+                    "current_material": None,
+                    "last_completed_material": snapshot.get("last_completed_material"),
+                    "materials_total": snapshot.get("materials_total", len(items)),
+                    "materials_done": snapshot.get("materials_done", 0),
+                    "batches_total": snapshot.get("batches_total", 0),
+                    "batches_done": snapshot.get("batches_done", 0),
                     "finished_at": now_iso(),
-                    "summary": to_json({"error": str(exc)}),
+                    "summary": to_json({
+                        "error": str(exc),
+                        "stopped_at": {
+                            "phase": snapshot.get("phase"),
+                            "phase_label": PHASE_LABELS.get(
+                                snapshot.get("phase"), snapshot.get("phase")),
+                            "current_material": snapshot.get("current_material"),
+                            "last_completed_material": snapshot.get("last_completed_material"),
+                        },
+                    }),
                 })
+            self.progress.finish(run_id, "failed", summary={
+                "error": str(exc),
+                "stopped_at": {
+                    "phase": snapshot.get("phase"),
+                    "phase_label": PHASE_LABELS.get(
+                        snapshot.get("phase"), snapshot.get("phase")),
+                    "current_material": snapshot.get("current_material"),
+                    "last_completed_material": snapshot.get("last_completed_material"),
+                },
+            })
             raise
 
     def _active_material(self, voyage: str, slug: str) -> dict[str, Any] | None:
@@ -258,7 +531,8 @@ class SamplingService:
             (voyage, slug),
         )
 
-    def _import_one(self, material: MaterialInput, replace: bool, withdraw: bool) -> IngestReport:
+    def _import_one(self, material: MaterialInput, replace: bool, withdraw: bool,
+                    run_id: str | None = None) -> IngestReport:
         voyage = slugify(material.voyage or DEFAULT_VOYAGE)
         slug = material.slug or slugify(Path(material.name).stem)
         kind = (material.kind or guess_kind(material.name, material.content)).lower()
@@ -684,9 +958,14 @@ class SamplingService:
         it affects, but sibling batches in the same voyage are re-resolved so
         claims stay mutually exclusive.
         """
+        run_id = _ACTIVE_RUN.get()
         voyages = sorted({
             key.split("|", 1)[0] if "|" in key else DEFAULT_VOYAGE for key in keys
         })
+        sweeping = run_id is not None and self._batch_sweep
+        if sweeping:
+            total = sum(len(self._batches_in_voyage(v)) for v in voyages)
+            self._progress_update(run_id, batches_total=total, batches_done=0)
         for voyage in voyages:
             self._resolve_voyage(voyage)
 
@@ -695,13 +974,14 @@ class SamplingService:
             "SELECT * FROM batches WHERE voyage = ? AND batch_code = ?", (voyage, code)
         )
 
-    def _resolve_voyage(self, voyage: str) -> None:
+    def _resolve_voyage(self, voyage: str) -> int:
+        """Re-resolve every batch of one voyage; returns the batch count."""
         self._ensure_batches(voyage)
         batches = self.db.fetchall(
             "SELECT * FROM batches WHERE voyage = ? ORDER BY batch_code", (voyage,)
         )
         if not batches:
-            return
+            return 0
         handover_rows = self.db.fetchall(
             "SELECT r.*, m.slug AS material_slug, m.name AS material_name, "
             "m.version AS material_version, m.id AS material_id FROM raw_records r "
@@ -751,7 +1031,7 @@ class SamplingService:
             self._pending_inputs[batch["id"]] = (rows, bottles)
 
         if not active:
-            return
+            return len(batches)
 
         # Priority: explicit laboratory batch hints first (they are definitive),
         # then the smaller batches, then batch code, so contention is resolved
@@ -769,11 +1049,15 @@ class SamplingService:
         # than dependent on import order or iteration count.
         claimed: set[str] = set()
         unresolved: list[dict[str, Any]] = []
-        for batch in ordered:
+        run_id = _ACTIVE_RUN.get()
+        for index, batch in enumerate(ordered, start=1):
             used = self._evaluate(batch, claimed)
             claimed |= used
             if self._batch_row(batch["voyage"], batch["batch_code"])["status"] == "held":
                 unresolved.append(batch)
+            if run_id and self._batch_sweep:
+                self._progress_update(run_id, batches_done=index)
+                self._pause_hook("batch", run_id)
         # A held batch claimed nothing, so a second pass cannot change any
         # decision; it only makes sure held batches were evaluated against the
         # final claim set.
@@ -785,6 +1069,7 @@ class SamplingService:
                 continue
             results = self._result_pool(batch, set())
             self._store_inputs(batch_id, rows, bottles, results)
+        return len(batches)
 
     def _ensure_batches(self, voyage: str) -> None:
         """Create a batch row for each dispatch code an active handover defines."""
@@ -2090,12 +2375,123 @@ class SamplingService:
         )], withdraw=True, trigger="withdraw")[0]
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.db.fetchall(
-            "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        self._ensure_readable()
+        self.progress.refresh()
+        live = {r["id"]: r for r in self.progress.active()}
+        if live or self.db.busy():
+            # An import is in flight (here, or observed through the sidecar);
+            # reading through the shared connection would either block or
+            # observe its uncommitted rows.  The sidecar carries the whole
+            # recent run list: history plus the live position.
+            return self._sidecar_runs(limit)
+        rows = self.db.try_fetchall(
+            "SELECT * FROM runs ORDER BY seq DESC, started_at DESC LIMIT ?", (limit,)
         )
-        for row in rows:
-            row["summary"] = from_json(row.get("summary"), None)
-        return rows
+        if rows is None:
+            return self._sidecar_runs(limit)
+        merged: list[dict[str, Any]] = [self._run_public(row, live.get(row["id"]))
+                                        for row in rows]
+        for run_id, record in live.items():
+            if all(item["id"] != run_id for item in merged):
+                # A run started by another process (e.g. a CLI import) whose
+                # row is not visible yet.
+                merged.insert(0, self._live_run(record))
+        merged.sort(key=lambda r: (r.get("seq") or 0, r.get("started_at") or ""),
+                    reverse=True)
+        return merged[:limit]
+
+    def _sidecar_runs(self, limit: int) -> list[dict[str, Any]]:
+        records = self.progress.all()
+        records.sort(key=lambda r: (r.get("seq") or 0, r.get("started_at") or ""),
+                     reverse=True)
+        return [self._live_run(r) for r in records[:limit]]
+
+    def _live_run(self, record: dict[str, Any]) -> dict[str, Any]:
+        """A run described from its sidecar entry (live or just finished)."""
+        phase = record.get("phase")
+        status = record.get("status") or "running"
+        summary = record.get("summary")
+        data = {
+            "id": record.get("id"),
+            "seq": record.get("seq") or 0,
+            "trigger": record.get("trigger"),
+            "status": status,
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase, phase),
+            "current_material": record.get("current_material"),
+            "last_completed_material": record.get("last_completed_material"),
+            "materials_total": record.get("materials_total", 0),
+            "materials_done": record.get("materials_done", 0),
+            "batches_total": record.get("batches_total", 0),
+            "batches_done": record.get("batches_done", 0),
+            "started_at": record.get("started_at"),
+            "updated_at": record.get("updated_at"),
+            "finished_at": record.get("finished_at"),
+            "summary": summary,
+            "in_flight": status == "running",
+        }
+        if isinstance(summary, dict) and summary.get("stopped_at"):
+            data["stopped_at"] = summary["stopped_at"]
+        return data
+
+    def _run_public(self, row: dict[str, Any],
+                    live: dict[str, Any] | None = None) -> dict[str, Any]:
+        summary = from_json(row.get("summary"), None)
+        live = live or self.progress.get(row["id"])
+        # Rows written before progress columns existed fall back to status.
+        phase = row.get("phase") or row["status"]
+        current = row.get("current_material")
+        last = row.get("last_completed_material")
+        materials_total = int(row.get("materials_total") or 0)
+        materials_done = int(row.get("materials_done") or 0)
+        batches_total = int(row.get("batches_total") or 0)
+        batches_done = int(row.get("batches_done") or 0)
+        running = bool(live and live.get("status") == "running")
+        if running:
+            # The row is only written when the transaction commits, so while
+            # the run is in flight the sidecar is the current position.
+            phase = live.get("phase") or phase
+            current = live.get("current_material")
+            last = live.get("last_completed_material")
+            materials_total = int(live.get("materials_total") or materials_total)
+            materials_done = int(live.get("materials_done") or 0)
+            batches_total = int(live.get("batches_total") or 0)
+            batches_done = int(live.get("batches_done") or 0)
+        data = {
+            "id": row["id"],
+            "seq": int(row.get("seq") or 0),
+            "trigger": row["trigger"],
+            "status": "running" if running else row["status"],
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase, phase),
+            "current_material": current,
+            "last_completed_material": last,
+            "materials_total": materials_total,
+            "materials_done": materials_done,
+            "batches_total": batches_total,
+            "batches_done": batches_done,
+            "started_at": row["started_at"],
+            "finished_at": row.get("finished_at"),
+            "summary": summary,
+            "in_flight": running,
+        }
+        if isinstance(summary, dict) and summary.get("stopped_at"):
+            data["stopped_at"] = summary["stopped_at"]
+        return data
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        self._ensure_readable()
+        self.progress.refresh()
+        # Never read through the shared connection while this process is
+        # inside an import transaction (it would see uncommitted rows).
+        row = None if self.db.busy() else self.db.fetchone(
+            "SELECT * FROM runs WHERE id = ?", (run_id,))
+        if row is None:
+            record = self.progress.get(run_id)
+            if record is None:
+                raise NotFound(f"run '{run_id}' not found")
+            return self._live_run(record)
+        return self._run_public(row)
 
     def stats(self) -> dict[str, Any]:
         return {
