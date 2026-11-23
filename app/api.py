@@ -46,6 +46,7 @@ class Api:
                     "GET  /api/batches",
                     "GET  /api/batches/{batch}",
                     "GET  /api/samples",
+                    "GET  /api/daily",
                     "GET  /api/review",
                     "GET  /api/review/{item_id}",
                     "POST /api/review/{item_id}/decide",
@@ -70,6 +71,8 @@ class Api:
             return self._batches(method, rest[1:], query, body)
         if rest and rest[0] == "samples":
             return self._samples(method, query)
+        if rest and rest[0] == "daily":
+            return self._daily(method, query)
         if rest and rest[0] == "review":
             return self._review(method, rest[1:], query, body)
         raise NotFound(f"unknown path '{path}'")
@@ -134,6 +137,15 @@ class Api:
             include_unpublished=truthy(first(query, "include_unpublished")),
             limit=int(first(query, "limit") or 200),
             offset=int(first(query, "offset") or 0),
+        )
+
+    def _daily(self, method: str, query: dict[str, list[str]]) -> tuple[int, Any]:
+        if method != "GET":
+            raise ServiceError("method not allowed", 405, "method_not_allowed")
+        return 200, self.service.daily_report(
+            voyage=first(query, "voyage"),
+            station=first(query, "station"),
+            day=first(query, "day") or first(query, "sample_day"),
         )
 
     def _review(self, method: str, rest: list[str], query: dict[str, list[str]],
@@ -297,6 +309,10 @@ GET  /api/batches?voyage=...&status=published|in_review|held
 GET  /api/batches/{batch_id_or_code}
 GET  /api/samples?voyage=...&batch=...&station=...&label=...&min_salinity=...
                   &max_salinity=...&include_unpublished=true&limit=&offset=
+GET  /api/daily?voyage=...&station=...&day=...
+  Per (station, sampling day): registered bottle count (held batches included),
+  published bottle count and the exact median of the published salinities.
+  Read from maintained summaries; the samples themselves are not scanned.
 GET  /api/review?status=open&batch=...&voyage=...
 GET  /api/review/{item_id}
 POST /api/review/{item_id}/decide

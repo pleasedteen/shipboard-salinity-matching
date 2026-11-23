@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from . import matching
 from .config import Settings
+from .daily import CURSOR_WALK_LIMIT, DailyLedger, bottle_id_for
 from .db import Database
 from .document import parse_document
 from .extract import EXTRACTORS, guess_kind
@@ -198,7 +199,22 @@ class SamplingService:
         self.settings = settings or Settings.from_env()
         self.db = db or Database(self.settings.database_url)
         self.db.ensure_schema()
+        self.daily = DailyLedger(self.db)
         self._recover_runs()
+        self._backfill_daily_report()
+
+    def _backfill_daily_report(self) -> None:
+        """Populate the report once for a database created before it existed.
+
+        Writing paths keep the report current from then on; the check costs two
+        ``COUNT(*)`` queries on normal startup.
+        """
+        if int(self.db.scalar("SELECT COUNT(*) FROM daily_bottle_facts", (), 0) or 0):
+            return
+        if not int(self.db.scalar("SELECT COUNT(*) FROM batch_bottles", (), 0) or 0):
+            return
+        with self.db.transaction():
+            self.daily.rebuild()
 
     # ==================================================================
     # Runs (resumability / observability)
@@ -747,6 +763,14 @@ class SamplingService:
             if any(batch.get(k) != v for k, v in metadata.items()):
                 metadata["updated_at"] = now_iso()
                 self.db.update("batches", batch["id"], metadata)
+            # The registered handover bottles define the daily report's totals,
+            # including bottles of a batch that is later set aside.
+            self.daily.register_batch(
+                batch["id"], voyage, station,
+                [{"id": bottle_id_for(batch["id"], b["key"]),
+                  "station": b["station"], "sampled_at": b["sampled_at"]}
+                 for b in bottles],
+            )
             active[batch["id"]] = self._batch_row(voyage, batch["batch_code"]) or batch
             self._pending_inputs[batch["id"]] = (rows, bottles)
 
@@ -844,6 +868,7 @@ class SamplingService:
         reason = reason or "no active handover material defines this batch"
         self.db.execute("DELETE FROM batch_bottles WHERE batch_id = ?", (batch["id"],))
         self.db.execute("DELETE FROM batch_inputs WHERE batch_id = ?", (batch["id"],))
+        self.daily.remove_batch(batch["id"])
         self._hold_unscoped(batch, reason)
 
     def _hold_unscoped(self, existing: dict[str, Any] | None, reason: str | None = None) -> None:
@@ -1218,6 +1243,7 @@ class SamplingService:
             or int(batch.get("pending_count") or 0) != pending
         )
         if current_version and comparison == latest_comparison and not summary_changed:
+            self._sync_daily(batch, rows, status, latest)
             return current_version
 
         self.db.update("batches", batch["id"], {
@@ -1229,6 +1255,7 @@ class SamplingService:
             "updated_at": stamp,
         })
         if current_version and comparison == latest_comparison:
+            self._sync_daily(batch, rows, status, latest)
             return current_version
 
         version = current_version + 1
@@ -1248,7 +1275,44 @@ class SamplingService:
                 "created_at": stamp,
                 "updated_at": stamp,
             })
+        self._sync_daily(batch, rows, status, latest)
         return version
+
+    def _sync_daily(self, batch: dict[str, Any], rows: list[dict[str, Any]],
+                    status: str, previous: list[dict[str, Any]] | None = None) -> None:
+        """Publish the batch's current pairings to the daily report.
+
+        Only published rows (``auto``/``confirmed``) carry a salinity; every
+        registered bottle stays counted even when its batch is held.  The
+        difference is taken against the batch's own previous result set (or,
+        for a brand new version, its stored facts), so replaying the same
+        result set writes nothing and cannot double count.
+
+        A single-bottle change is applied as one constant-size ledger update;
+        a user review of one bottle pays for that bottle, not for the group.
+        """
+        current = ({bottle_id_for(batch["id"], row["bottle_id"]): row["salinity"]
+                    for row in rows}
+                   if status in ("published", "in_review") else {})
+        prior = ({bottle_id_for(batch["id"], row["bottle_id"]): row["salinity"]
+                  for row in previous}
+                 if batch.get("status") in ("published", "in_review") else {})
+        changed = [bottle_id for bottle_id in set(prior) | set(current)
+                   if (bottle_id in prior) != (bottle_id in current)
+                   or prior.get(bottle_id) != current.get(bottle_id)]
+        if not changed:
+            # Nothing visible changed, so the report already agrees.
+            return
+        if len(changed) > CURSOR_WALK_LIMIT:
+            # A whole batch appears or disappears (first publication, a review
+            # completing a batch): reconcile it in one pass.
+            self.daily.set_bottles(batch["id"], current)
+            return
+        # A single-bottle change (the common review action) is applied one
+        # bottle at a time, each a constant-size ledger update.
+        for bottle_id in changed:
+            self.daily.set_bottle(
+                bottle_id, bottle_id in current, current.get(bottle_id))
 
     # ==================================================================
     # Review items
@@ -2107,6 +2171,73 @@ class SamplingService:
                 "SELECT COUNT(*) FROM review_items WHERE status = 'open'", (), 0) or 0),
             "database": "postgresql" if not self.db.is_sqlite else "sqlite",
         }
+
+    # ==================================================================
+    # Voyage daily report
+    # ==================================================================
+    def daily_report(self, voyage: str | None = None, station: str | None = None,
+                     day: str | None = None) -> dict[str, Any]:
+        """Current handed-over / published bottle counts and exact median.
+
+        Every figure comes from the incrementally maintained summaries; the
+        samples themselves are not read, so a group of 100 000 bottles costs
+        one indexed lookup per ``(station, day)`` group returned.
+        """
+        items = self.daily.read(
+            voyage=slugify(voyage) if voyage else None,
+            station=station,
+            day=day,
+        )
+        return {
+            "items": items,
+            "total_groups": len(items),
+            "bottle_count": sum(item["bottle_count"] for item in items),
+            "published_count": sum(item["published_count"] for item in items),
+        }
+
+    def rebuild_daily_report(self, voyage: str | None = None) -> None:
+        """Recompute the daily report from the sample tables (repair only)."""
+        self.daily.rebuild(slugify(voyage) if voyage else None)
+
+    def daily_report_drift(self, voyage: str | None = None) -> list[dict[str, Any]]:
+        """Compare the maintained summaries with an independent recomputation.
+
+        The recomputation sorts the published samples directly, so this is the
+        reference the incremental state is checked against.  Returns one entry
+        per disagreeing group; an empty list means the report is exact.
+        """
+        target = slugify(voyage) if voyage else None
+        current = {(row["voyage"], row["station"], row["sample_day"]): row
+                   for row in self.daily.read(voyage=target)}
+        expected = self.daily.scan(target)
+        drift = []
+        for group in sorted(set(current) | set(expected)):
+            left = current.get(group)
+            right = expected.get(group)
+            same = (
+                left is not None and right is not None
+                and left["bottle_count"] == right["bottle_count"]
+                and left["published_count"] == right["published_count"]
+                and left["salinity_count"] == right["salinity_count"]
+                and left["salinity_median"] == right["salinity_median"]
+            )
+            if not same:
+                drift.append({
+                    "voyage": group[0], "station": group[1], "sample_day": group[2],
+                    "maintained": None if left is None else {
+                        "bottle_count": left["bottle_count"],
+                        "published_count": left["published_count"],
+                        "salinity_count": left["salinity_count"],
+                        "salinity_median": left["salinity_median"],
+                    },
+                    "recomputed": None if right is None else {
+                        "bottle_count": right["bottle_count"],
+                        "published_count": right["published_count"],
+                        "salinity_count": right["salinity_count"],
+                        "salinity_median": right["salinity_median"],
+                    },
+                })
+        return drift
 
 
 # ---------------------------------------------------------------------------

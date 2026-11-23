@@ -107,6 +107,19 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_daily(args: argparse.Namespace) -> int:
+    service = service_for(args)
+    out = service.daily_report(voyage=args.voyage, station=args.station, day=args.day)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_daily_check(args: argparse.Namespace) -> int:
+    from app.dailycheck import run
+
+    return run()
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     service = service_for(args)
     if args.decide:
@@ -172,6 +185,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--offset", type=int, default=0)
     p.set_defaults(func=cmd_query)
+
+    p = sub.add_parser("daily", help="voyage daily report (counts and exact median)")
+    p.add_argument("--voyage")
+    p.add_argument("--station")
+    p.add_argument("--day")
+    p.set_defaults(func=cmd_daily)
+
+    p = sub.add_parser("daily-check", help="offline verification of the daily report")
+    p.set_defaults(func=cmd_daily_check)
 
     p = sub.add_parser("review", help="list or resolve review items")
     p.add_argument("--status", default="open")

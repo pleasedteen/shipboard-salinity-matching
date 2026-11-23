@@ -208,6 +208,66 @@ SCHEMA: tuple[str, ...] = (
         summary TEXT
     )
     """,
+    # ------------------------------------------------------------------
+    # Voyage daily report (materialised, incrementally maintained)
+    #
+    # One summary row per (voyage, station, sampling day).  Bottle counts are
+    # kept as running totals and the exact salinity median is maintained from
+    # an indexed bucket table so that neither reading a summary nor applying a
+    # single-bottle change has to scan a group's samples.
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS daily_reports (
+        voyage TEXT NOT NULL,
+        station TEXT NOT NULL,
+        sample_day TEXT NOT NULL,
+        bottle_count INTEGER NOT NULL DEFAULT 0,
+        published_count INTEGER NOT NULL DEFAULT 0,
+        salinity_count INTEGER NOT NULL DEFAULT 0,
+        lower_value DOUBLE PRECISION,
+        lower_before INTEGER NOT NULL DEFAULT 0,
+        upper_value DOUBLE PRECISION,
+        upper_before INTEGER NOT NULL DEFAULT 0,
+        median_value DOUBLE PRECISION,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (voyage, station, sample_day)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS daily_bottle_facts (
+        bottle_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        voyage TEXT NOT NULL,
+        station TEXT NOT NULL,
+        sample_day TEXT NOT NULL,
+        published INTEGER NOT NULL DEFAULT 0,
+        salinity DOUBLE PRECISION,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_daily_facts_batch ON daily_bottle_facts(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_daily_facts_group "
+    "ON daily_bottle_facts(voyage, station, sample_day, published)",
+    """
+    CREATE TABLE IF NOT EXISTS daily_batches (
+        batch_id TEXT PRIMARY KEY,
+        register_signature TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS daily_salinity_buckets (
+        voyage TEXT NOT NULL,
+        station TEXT NOT NULL,
+        sample_day TEXT NOT NULL,
+        salinity_key TEXT NOT NULL,
+        salinity DOUBLE PRECISION NOT NULL,
+        bottle_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (voyage, station, sample_day, salinity_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_daily_bucket_order "
+    "ON daily_salinity_buckets(voyage, station, sample_day, salinity, salinity_key)",
 )
 
 
@@ -313,6 +373,24 @@ class Database:
             count = cur.rowcount
             cur.close()
             return count
+
+    def executemany(self, query: str, rows: Iterable[Iterable[Any]]) -> None:
+        """Run one statement for a list of parameter rows in one round trip."""
+        values = [tuple(row) for row in rows]
+        if not values:
+            return
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError("database connection is closed")
+            cur = self._conn.cursor()
+            statement = self.sql(query)
+            runner = getattr(cur, "executemany", None)
+            if runner is not None:
+                runner(statement, values)
+            else:  # pragma: no cover - minimal DB-API shims (tests)
+                for parameters in values:
+                    cur.execute(statement, parameters)
+            cur.close()
 
     def insert(self, table: str, values: dict[str, Any]) -> None:
         cols = list(values)

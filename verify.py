@@ -121,6 +121,22 @@ def demo() -> str:
             lines.append(
                 "   - " + ", ".join(f"{r.name}:{r.status}" for r in again)
             )
+
+            lines.append("")
+            lines.append("7. Voyage daily report (by station and sampling day)")
+            report = service.daily_report(voyage=VOYAGE)
+            for item in report["items"]:
+                median = item["salinity_median"]
+                lines.append(
+                    f"   - {item['station']:<4} {item['sample_day']}  "
+                    f"bottles={item['bottle_count']} published={item['published_count']} "
+                    f"median={'—' if median is None else f'{median:.4f}'}"
+                )
+            lines.append(
+                f"   ({report['bottle_count']} registered bottles, "
+                f"{report['published_count']} published; "
+                f"drift vs samples: {len(service.daily_report_drift(VOYAGE))})"
+            )
         finally:
             service.db.close()
     return "\n".join(lines)

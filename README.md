@@ -160,6 +160,29 @@ GET /api/materials?voyage=KX-26-03&history=true
 GET /api/materials/{slug}
 ```
 
+### 航次日报
+
+```
+GET /api/daily?voyage=KX-26-03&station=S01&day=2026-03-01
+```
+
+按「航次 + 站次 + 采样日」给出一个组的三个当期指标：
+
+| 字段 | 含义 |
+| --- | --- |
+| `bottle_count` | 现行交接单在册瓶数；因配不齐而**暂缓发布（held）**的批，其在册瓶仍计入 |
+| `published_count` | 已发布瓶数（`auto` / `confirmed`；`in_review` 批只计所有可行配对下归属一致的瓶） |
+| `salinity_median` | 已发布盐度的**精确**中位数；偶数个时取中间两个值的算术平均，无值时为 `null` |
+
+三者与样本发布在**同一事务**内写入，导入、替换、撤回、复核确认后立即一致，不存在“翻完样本页才算得对”的窗口。指标由增量维护的汇总提供，读取与单瓶变动都不扫描整组明细（见第 7 节）。
+
+命令行同样可用：
+
+```bash
+python3 run.py daily --voyage KX-26-03 --station S01
+python3 run.py daily-check            # 一条命令离线校验数值、回滚重试与开销
+```
+
 ### 复核队列
 
 ```
@@ -247,12 +270,39 @@ python3 run.py --database "$DATABASE_URL" import --fixtures fixtures --voyage KX
 
 ---
 
-## 7. 测试与夹具
+## 7. 航次日报的增量维护
+
+日报（第 3 节的 `/api/daily`）不读样本页，而是维护四张表：
+
+| 表 | 内容 |
+| --- | --- |
+| `daily_bottle_facts` | 每只在册瓶一行：所属批次、所属组（航次/站次/采样日）、是否已发布、发布盐度 |
+| `daily_salinity_buckets` | 每组每个盐度值一行及瓶数，按 `(航次, 站次, 采样日, 盐度)` 建索引 |
+| `daily_reports` | 每组一行汇总：在册瓶数、已发布瓶数、盐度个数、精确中位数、中位数游标 |
+| `daily_batches` | 每个批次在册瓶集合的签名，登记幂等 |
+
+- **与发布同事务**：批次结果写入与汇总更新在同一个事务里；导入、替换、撤回、复核确认后指标立即生效，回滚时一起回滚。
+- **不重复计数**：所有写路径都报告“改动前后的状态”，汇总是差值累加；同一状态重放（重试、重复导入）不产生任何计数变化。
+- **单瓶 O(1)**：复核确认一只瓶只触碰该瓶的 fact、组的汇总与中位数游标（最多再看两个相邻桶），不扫描整组明细；应用端也不加载整组行。
+- **首次/整批发布**：用一次有序聚合定位中位数，而不是逐瓶移动游标。
+- **精确中位数**：偶数个取中间两值算术平均（用 `Decimal` 计算），与逐样本排序结果完全一致。
+- **自检/修复**：`daily.scan()` 直接对样本表独立重算；`SamplingService.daily_report_drift()` 比对增量结果与重算结果；`rebuild_daily_report()` 按样本表重建汇总（仅离线修复时使用）。
+
+---
+
+## 8. 测试与夹具
 
 ```bash
 python3 verify.py                        # 全部测试 + 走查（约 7–8 秒，远低于 80 秒）
 python3 -m unittest discover -s tests -t tests -v
+python3 run.py daily-check               # 航次日报离线校验：数值、回滚重试、开销
 ```
+
+`daily-check` 依次验证：
+
+1. **数值**：导入、复核确认、数值替换、撤回之后，每组在册/已发布瓶数与精确中位数都与独立重算一致；暂缓批的在册瓶仍计入。
+2. **回滚与重试**：在发布之后注入失败 → 汇总随事务整体回滚；同一改动重跑成功且每瓶只计一次；再次重放相同导入不改变任何指标。
+3. **开销**：构造单组 100 000 瓶，用 SQLite 虚拟机步数计量“读汇总”和“单瓶变动”，并统计应用端加载的行数；两者各限 50 000 步、64 行。
 
 夹具（`fixtures/`）覆盖题目要求的各种材料特征，且无需访问外部站点：
 
@@ -275,7 +325,7 @@ python3 -m unittest discover -s tests -t tests -v
 
 ---
 
-## 8. 项目结构
+## 9. 项目结构
 
 ```
 app/
@@ -284,9 +334,11 @@ app/
   document.py   HTML / 文本 → 统一事件流（标题/段落/表格，含 colspan/rowspan）
   extract.py    三类材料的抽取、栏名同义词、翻页续写、页码与置信度
   matching.py   瓶签/站次/时段兼容性、完美匹配、候选集与语义指纹
-  service.py    导入、批次解析、版本发布、复核决定、查询
+  daily.py      航次日报的增量维护（在册/已发布瓶数、精确盐度中位数）
+  dailycheck.py 航次日报离线校验（数值、回滚重试、10 万瓶组开销）
+  service.py    导入、批次解析、版本发布、复核决定、查询、日报
   api.py        stdlib HTTP 服务与 JSON 接口
-run.py          命令行入口（serve / import / revise / withdraw / query / review …）
+run.py          命令行入口（serve / import / revise / withdraw / query / daily / review …）
 verify.py       一条命令完成验证
 fixtures/       材料夹具
 tests/          自动化测试（标准库 unittest）
