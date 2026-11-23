@@ -321,10 +321,25 @@ class ExtractFinding:
 
 
 @dataclass
+class SegmentInfo:
+    """Diagnostics for one batch section of a batch-segmented report.
+
+    A re-uploaded laboratory report may drop a batch's section, keep only its
+    heading, or carry a salinity table nothing can be read from.  The importer
+    uses these counts to say which of those happened.
+    """
+    batch_hint: str
+    tables: int = 0        # tables seen while this batch's heading governed
+    data_rows: int = 0     # non-header grid rows seen under the heading
+    findings: int = 0      # usable result rows extracted for the batch
+
+
+@dataclass
 class ExtractResult:
     kind: str
     findings: list[ExtractFinding] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    segments: list[SegmentInfo] = field(default_factory=list)
 
 
 def _occurrence_keys(findings: list[ExtractFinding]) -> None:
@@ -642,6 +657,17 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
     page = 1
     ordinal = 0
     seen: set[str] = set()
+    segments: dict[str, SegmentInfo] = {}
+
+    def segment_for(hint: str | None) -> SegmentInfo | None:
+        if not hint:
+            return None
+        key = normalize_station(hint)
+        if not key:
+            return None
+        if key not in segments:
+            segments[key] = SegmentInfo(batch_hint=hint)
+        return segments[key]
 
     for event in doc.events:
         if event.type in ("heading", "paragraph"):
@@ -658,6 +684,7 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
             time_info = split_time_range(text, date, current_time if not date else None)
             if batch:
                 current_batch = batch
+                segment_for(batch)
             if station:
                 current_station = station
             if time_info.start:
@@ -668,6 +695,9 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
 
         if event.type != "table":
             continue
+        segment = segment_for(current_batch)
+        if segment is not None:
+            segment.tables += 1
         mapping: dict[str, int] | None = None
         for row in event.rows:
             texts = row.texts()
@@ -678,6 +708,8 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
                 if "label" in row_mapping or "salinity" in row_mapping:
                     mapping = row_mapping
                 continue
+            if segment is not None:
+                segment.data_rows += 1
             if mapping is None:
                 continue
             label = _cell(row, mapping, "label")
@@ -780,8 +812,12 @@ def extract_lab(doc: ParsedDocument, material_slug: str, material_name: str) -> 
                 continue
             seen.add(dedupe)
             result.findings.append(finding)
+            own = segment_for(finding.fields.get("batch_hint"))
+            if own is not None:
+                own.findings += 1
 
     _occurrence_keys(result.findings)
+    result.segments = list(segments.values())
     if not result.findings:
         result.warnings.append("no laboratory salinity rows recognised")
     return result

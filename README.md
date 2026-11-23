@@ -112,6 +112,15 @@ POST /api/materials
 - 相同内容重复提交（包括 `replace: true`）不会新建材料，也不会改变任何批次。
 - 文件名相同但内容不同：替换该材料，旧版本标记为 `superseded`，只重跑受影响的批次。
 
+### 实验室报告补传（缺段沿用）
+
+按批次分段的实验室报告补传时，新版可能缺少某些批次的段落、只剩标题，或盐度表读不出有效行。此时**该批次沿用本报告最近一次可用的段落**，其余批次照常按新版更新：
+
+- 导入结果的 `carried_over` 列出每个被沿用的批次：`reason`（`missing` 缺段 / `heading_only` 只剩标题 / `unreadable` 盐度表读不出）、`records`（沿用条数）、`source_version`（沿用自第几版），`warnings` 中同时给出中文说明。
+- 沿用按批次独立链接到**实际采用的原稿版本**：查询与批次详情中 `provenance.lab` 增加 `material_id` 与 `material_version`，复核项的原文也取自该版本，而不是缺段的新版。
+- 沿用的记录键不变，因此证据与归属未变时既有复核决定继续有效；连续两版交替缺段时，每个批次各自沿用其最近一次可用的版本。
+- 撤回整份报告时，历次沿用的段落一并停用，依赖它们的批次转为 `held`；撤回后重新上传全新内容不会复活已撤回的段落，重新上传与原内容完全相同的文件则按 `restored` 恢复。
+
 ### 替换 / 撤回一份材料
 
 ```
@@ -144,6 +153,7 @@ GET /api/samples?voyage=KX-26-03&batch=KX-2603-A&station=S01&label=S01-001
     "deck":     [{"material": "deck_log", "file": "deck_log.html", "line": 15,
                   "section": "站次 S01 · 2026-03-01", "excerpt": "S01-001 | 08:00 | 5 | 盐度 | 表层"}],
     "lab":      {"material": "lab_results_1", "file": "lab_results_1.txt", "line": 10,
+                 "material_id": "mat_…", "material_version": 2,
                  "excerpt": "LAB-A-01 | S01-001 | 33.842"}
   }
 }

@@ -114,6 +114,18 @@ SCHEMA: tuple[str, ...] = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_key ON lab_results(record_key)",
     "CREATE INDEX IF NOT EXISTS idx_lab_active ON lab_results(voyage, active)",
     """
+    CREATE TABLE IF NOT EXISTS lab_carryover (
+        material_id TEXT NOT NULL,
+        batch_key TEXT NOT NULL,
+        record_key TEXT NOT NULL,
+        source_material_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (material_id, record_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_carryover_record ON lab_carryover(record_key, source_material_id)",
+    """
     CREATE TABLE IF NOT EXISTS batch_inputs (
         batch_id TEXT NOT NULL,
         material_id TEXT NOT NULL,

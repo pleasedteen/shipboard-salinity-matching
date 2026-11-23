@@ -76,6 +76,7 @@ class IngestReport:
     records: int = 0
     replaced_material_id: str | None = None
     affected_batches: list[str] = field(default_factory=list)
+    carried_over: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     status: str = "ok"
 
@@ -92,6 +93,7 @@ class IngestReport:
             "records": self.records,
             "replaced_material_id": self.replaced_material_id,
             "affected_batches": self.affected_batches,
+            "carried_over": self.carried_over,
             "warnings": self.warnings,
         }
 
@@ -302,8 +304,8 @@ class SamplingService:
             )
             # Re-derive the rows so a reverted material owns its records again;
             # derived lab rows otherwise still point at the superseded version.
-            self._extract(prior["id"], voyage, prior["slug"], prior["name"],
-                          prior["content"], prior["kind"])
+            extraction = self._extract(prior["id"], voyage, prior["slug"], prior["name"],
+                                       prior["content"], prior["kind"])
             self._refresh_lab_activity()
             report.material_id = prior["id"]
             if previous_active is not None:
@@ -317,6 +319,12 @@ class SamplingService:
             affected = set(self._batch_keys_for_material(prior["id"]))
             if previous_active is not None:
                 affected |= set(self._batch_keys_for_material(previous_active["id"]))
+            if prior["kind"] == "lab":
+                # batch_inputs may no longer mention this material (e.g. the
+                # last resolution ran while it was withdrawn), so derive the
+                # batches from its rows and from the sections it carries over.
+                affected |= self._batch_keys_for_lab(voyage, extraction.findings)
+                affected |= self._carried_batch_keys(prior["id"])
             report.affected_batches = sorted(affected)
             self._refresh_batches(report.affected_batches)
             return report
@@ -362,6 +370,15 @@ class SamplingService:
         report.warnings.extend(extraction.warnings)
 
         if kind == "lab":
+            if existing is not None:
+                # A re-uploaded report may be missing batch sections; keep each
+                # affected batch's most recent usable section instead of
+                # dropping its results.
+                carried = self._carry_over_lab_segments(existing, material_id, extraction)
+                if carried:
+                    self._refresh_lab_activity()
+                    report.carried_over = carried
+                    report.warnings.extend(entry["message"] for entry in carried)
             affected |= self._batch_keys_for_lab(voyage, extraction.findings)
         if kind == "deck":
             affected |= self._batch_keys_for_deck(voyage, extraction.findings)
@@ -383,6 +400,11 @@ class SamplingService:
         if material["kind"] == "handover":
             # Removing the sheet may leave batches without any definition.
             affected |= set(self._batch_keys_for_voyage(material["voyage"]))
+        if material["kind"] == "lab":
+            # Sections this report carried over from earlier versions are
+            # still in use; withdrawing the report stops them as well, so the
+            # batches that read those sections are also re-resolved.
+            affected |= self._carried_batch_keys(material_id)
         self.db.execute(
             "UPDATE materials SET status = 'withdrawn', updated_at = ? WHERE id = ?",
             (stamp, material_id),
@@ -562,14 +584,112 @@ class SamplingService:
 
         ``present`` records whether the current extraction of that material
         still contains the row; ``active`` adds the material-level condition.
-        Keeping them separate means reverting to an earlier material version
-        restores exactly the rows that version contained.
+        A row also stays active while a newer version of its report re-uses
+        (carries over) the batch section it belongs to — re-uploads can drop
+        a section, and the batch then keeps its most recent usable section.
+        Keeping the conditions separate means reverting to an earlier material
+        version restores exactly the rows that version used.
         """
         self.db.execute(
-            "UPDATE lab_results SET active = CASE WHEN present = 1 AND EXISTS ("
-            "SELECT 1 FROM materials m WHERE m.id = lab_results.material_id "
-            "AND m.status = 'active') THEN 1 ELSE 0 END"
+            "UPDATE lab_results SET active = CASE WHEN present = 1 AND ("
+            "EXISTS (SELECT 1 FROM materials m WHERE m.id = lab_results.material_id "
+            "AND m.status = 'active') OR EXISTS ("
+            "SELECT 1 FROM lab_carryover c "
+            "JOIN materials m2 ON m2.id = c.material_id "
+            "WHERE c.record_key = lab_results.record_key "
+            "AND c.source_material_id = lab_results.material_id "
+            "AND m2.status = 'active')) THEN 1 ELSE 0 END"
         )
+
+    # ==================================================================
+    # Carrying batch sections across a defective re-upload
+    # ==================================================================
+    def _carry_over_lab_segments(self, previous: dict[str, Any], new_material_id: str,
+                                 extraction: Any) -> list[dict[str, Any]]:
+        """Keep the most recent usable section for batches the new report lost.
+
+        ``previous`` is the version being replaced.  Its *effective* sections
+        are its own extracted rows plus the sections it had itself carried
+        over; the source of a carried section therefore stays the original
+        manuscript version, however many defective re-uploads came between.
+        Returns the report entries explaining each kept section.
+        """
+        usable = {
+            normalize_station(f.fields.get("batch_hint"))
+            for f in extraction.findings if f.fields.get("batch_hint")
+        }
+        effective: dict[str, dict[str, Any]] = {}
+        for row in self.db.fetchall(
+            "SELECT record_key, batch_hint FROM lab_results "
+            "WHERE material_id = ? AND present = 1 AND batch_hint IS NOT NULL",
+            (previous["id"],),
+        ):
+            key = normalize_station(row["batch_hint"])
+            if key:
+                effective.setdefault(key, {"source": previous["id"], "records": []})
+                effective[key]["records"].append(row["record_key"])
+        for row in self.db.fetchall(
+            "SELECT record_key, batch_key, source_material_id FROM lab_carryover "
+            "WHERE material_id = ?",
+            (previous["id"],),
+        ):
+            entry = effective.setdefault(
+                row["batch_key"], {"source": row["source_material_id"], "records": []})
+            entry["records"].append(row["record_key"])
+
+        diagnostics = {
+            normalize_station(s.batch_hint): s for s in getattr(extraction, "segments", [])
+        }
+        stamp = now_iso()
+        carried: list[dict[str, Any]] = []
+        for key in sorted(effective):
+            if not key or key in usable:
+                continue
+            info = effective[key]
+            segment = diagnostics.get(key)
+            if segment is None:
+                reason = "missing"
+            elif segment.tables == 0:
+                reason = "heading_only"
+            else:
+                reason = "unreadable"
+            for record_key in info["records"]:
+                self.db.insert("lab_carryover", {
+                    "material_id": new_material_id,
+                    "batch_key": key,
+                    "record_key": record_key,
+                    "source_material_id": info["source"],
+                    "reason": reason,
+                    "created_at": stamp,
+                })
+            carried.append(self._carry_over_entry(key, reason, info))
+        return carried
+
+    def _carry_over_entry(self, batch_key: str, reason: str,
+                          info: dict[str, Any]) -> dict[str, Any]:
+        source = self.db.fetchone(
+            "SELECT id, name, version, voyage FROM materials WHERE id = ?",
+            (info["source"],),
+        ) or {}
+        voyage = source.get("voyage") or DEFAULT_VOYAGE
+        batch_code = self._batch_code_for_key(voyage, batch_key) or batch_key
+        count = len(info["records"])
+        reason_text = {
+            "missing": "新版报告缺少该批次段落",
+            "heading_only": "新版报告该批次只剩标题，没有盐度表",
+            "unreadable": "新版报告该批次的盐度表读不出有效行",
+        }[reason]
+        message = (f"批次 {batch_code}：{reason_text}，沿用第 "
+                   f"{source.get('version', '?')} 版（{source.get('name', '?')}）"
+                   f"最近一次可用的 {count} 条结果")
+        return {
+            "batch": batch_code,
+            "reason": reason,
+            "message": message,
+            "records": count,
+            "source_material_id": info["source"],
+            "source_version": source.get("version"),
+        }
 
     # ==================================================================
     # Which batches are affected?
@@ -593,6 +713,28 @@ class SamplingService:
 
     def _batches_in_voyage(self, voyage: str) -> list[dict[str, Any]]:
         return self.db.fetchall("SELECT * FROM batches WHERE voyage = ?", (voyage,))
+
+    def _batch_code_for_key(self, voyage: str, batch_key: str) -> str | None:
+        """The batch code whose normalised form is ``batch_key``, if any."""
+        for row in self._batches_in_voyage(voyage):
+            if normalize_station(row["batch_code"]) == batch_key:
+                return row["batch_code"]
+        return None
+
+    def _carried_batch_keys(self, *material_ids: str) -> set[str]:
+        """Batches that read sections these material versions carry over."""
+        keys: set[str] = set()
+        for material_id in material_ids:
+            rows = self.db.fetchall(
+                "SELECT DISTINCT c.batch_key, m.voyage FROM lab_carryover c "
+                "JOIN materials m ON m.id = c.material_id WHERE c.material_id = ?",
+                (material_id,),
+            )
+            for row in rows:
+                code = self._batch_code_for_key(row["voyage"], row["batch_key"])
+                if code:
+                    keys.add(f"{row['voyage']}|{code}")
+        return keys
 
     def _batch_keys_for_voyage(self, voyage: str) -> list[str]:
         return sorted({f"{r['voyage']}|{r['batch_code']}" for r in self._batches_in_voyage(voyage)})
@@ -1554,12 +1696,24 @@ class SamplingService:
         lab_map = {r["record_key"]: r for r in self.db.fetchall(
             "SELECT * FROM lab_results WHERE active = 1 AND voyage = ?", (row["voyage"],)
         )}
+        material_versions = {m["id"]: m["version"] for m in self.db.fetchall(
+            "SELECT id, version FROM materials WHERE voyage = ?", (row["voyage"],)
+        )}
         by_bottle = {r["bottle_id"]: r for r in results}
         items = []
         for bottle in bottles:
             res = by_bottle.get(bottle["record_key"])
             lab = lab_map.get(res["lab_result_id"]) if res else None
             payload = from_json(res.get("payload"), {}) if res else {}
+            lab_locator = from_json(lab.get("locator"), {}) if lab else {}
+            if lab:
+                # The manuscript version this batch actually reads; a section
+                # carried over from an older report keeps that version here.
+                lab_locator = {
+                    **lab_locator,
+                    "material_id": lab["material_id"],
+                    "material_version": material_versions.get(lab["material_id"]),
+                }
             items.append({
                 "bottle_key": bottle["record_key"],
                 "label": bottle["label_raw"],
@@ -1578,7 +1732,7 @@ class SamplingService:
                 "provenance": {
                     "handover": from_json(bottle.get("locator"), {}),
                     "deck": payload.get("deck_locators", []),
-                    "lab": from_json(lab.get("locator"), {}) if lab else {},
+                    "lab": lab_locator,
                 },
                 "matching_reasons": payload.get("matching_reasons", []),
             })
@@ -1649,10 +1803,12 @@ class SamplingService:
             "b.station AS batch_station, bb.ordinal, bb.label_raw, bb.station AS bottle_station, "
             "bb.sampled_at, bb.locator AS bottle_locator, bb.confidence AS bottle_confidence, "
             "lr.locator AS result_locator, lr.label_raw AS result_label, "
-            "lr.confidence AS result_confidence, lr.payload AS result_payload "
+            "lr.confidence AS result_confidence, lr.payload AS result_payload, "
+            "lr.material_id AS result_material_id, lm.version AS result_material_version "
             "FROM batch_results br JOIN batches b ON b.id = br.batch_id "
             "JOIN batch_bottles bb ON bb.batch_id = br.batch_id AND bb.record_key = br.bottle_id "
             "LEFT JOIN lab_results lr ON lr.record_key = br.lab_result_id AND lr.active = 1 "
+            "LEFT JOIN materials lm ON lm.id = lr.material_id "
             "WHERE br.batch_version = b.version"
         )
         params: list[Any] = []
@@ -1683,6 +1839,15 @@ class SamplingService:
         for row in rows[offset: offset + limit]:
             payload = from_json(row.get("payload"), {})
             lab_payload = from_json(row.get("result_payload"), {})
+            lab_locator = from_json(row["result_locator"], {}) if row["result_locator"] else None
+            if lab_locator is not None and row.get("result_material_id"):
+                # Point at the exact manuscript version the row was read from;
+                # a carried-over section keeps its original version here.
+                lab_locator = {
+                    **lab_locator,
+                    "material_id": row["result_material_id"],
+                    "material_version": row["result_material_version"],
+                }
             items.append({
                 "batch": row["batch_code"],
                 "batch_id": row["batch_id"],
@@ -1706,7 +1871,7 @@ class SamplingService:
                 "provenance": {
                     "handover": row["bottle_locator"] and from_json(row["bottle_locator"], {}),
                     "deck": payload.get("deck_locators", []),
-                    "lab": row["result_locator"] and from_json(row["result_locator"], {}),
+                    "lab": lab_locator,
                     "lab_reasons": lab_payload.get("reason_codes", []),
                     "matching_reasons": payload.get("matching_reasons", []),
                 },
@@ -1746,16 +1911,29 @@ class SamplingService:
         if row is None:
             raise NotFound(f"review item '{item_id}' not found")
         public = self._review_public(row)
-        material = self.db.fetchone(
-            "SELECT id, slug, name, kind FROM materials WHERE slug = ? AND status = 'active'",
-            (row["source_material"],),
-        ) if row["source_material"] else None
+        # The source is the exact material version the row was read from,
+        # which may be an older version whose section was carried over.
+        payload = from_json(row["payload"], {})
+        material = None
+        material_id = payload.get("material_id") if isinstance(payload, dict) else None
+        if material_id:
+            material = self.db.fetchone(
+                "SELECT id, slug, name, kind, version FROM materials WHERE id = ?",
+                (material_id,),
+            )
+        if material is None and row["source_material"]:
+            material = self.db.fetchone(
+                "SELECT id, slug, name, kind, version FROM materials "
+                "WHERE slug = ? AND status = 'active'",
+                (row["source_material"],),
+            )
         if material:
             public["source"] = {
                 "material_id": material["id"],
                 "slug": material["slug"],
                 "name": material["name"],
                 "kind": material["kind"],
+                "version": material["version"],
                 "content": self.db.scalar(
                     "SELECT content FROM materials WHERE id = ?", (material["id"],), ""
                 ),

@@ -286,10 +286,14 @@ POST /api/materials
 POST /api/materials/{slug}/revise   Body: {"content": "..."}
   Replaces one material and re-runs only the batches that consume it.
   Reviewer decisions survive when the meaning and feasible pairings are
-  unchanged.
+  unchanged.  If the new laboratory report is missing a batch's section
+  (dropped, heading only, or an unreadable salinity table), the batch keeps
+  the report's most recent usable section; the response lists these in
+  "carried_over" with the reason and the source version.
 
 POST /api/materials/{slug}/withdraw
   Withdraws a material. Batches it defined are held; other batches continue.
+  Sections earlier versions contributed to this report are stopped as well.
 
 GET  /api/materials?voyage=...&history=true
 GET  /api/materials/{slug}?voyage=...

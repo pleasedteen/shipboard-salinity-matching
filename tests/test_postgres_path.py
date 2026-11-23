@@ -113,6 +113,18 @@ class PostgresDialectTests(unittest.TestCase):
                        value={"result": item["candidates"][0]["result"]})
         self.assertEqual(service.get_batch("KX-2603-G")["status"], "published")
 
+        # A defective re-upload keeps the missing batch's previous section.
+        old = (FIXTURES / "lab_results_1.txt").read_text(encoding="utf-8")
+        lines = old.splitlines()
+        start = next(i for i, line in enumerate(lines) if "KX-2603-B" in line)
+        end = next(i for i, line in enumerate(lines) if "KX-2603-C" in line)
+        defective = "\n".join(lines[:start] + lines[end:]) + "\n"
+        report = service.revise_material("lab_results_1", defective)
+        self.assertEqual([c["batch"] for c in report.carried_over], ["KX-2603-B"])
+        self.assertEqual(service.get_batch("KX-2603-B")["status"], "published")
+        service.withdraw_material("lab_results_1")
+        self.assertEqual(service.get_batch("KX-2603-B")["status"], "held")
+
         # No un-translated placeholder may reach the driver.
         for connection in self.connections:
             for query in connection.issued:
