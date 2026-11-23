@@ -124,6 +124,29 @@ class ApiTests(ServiceTestCase):
         self.assertEqual(status, 200)
         self.assertIn("endpoints", body)
 
+    def test_http_import_rejects_path(self) -> None:
+        # An HTTP caller may only send the material body; a server-side path
+        # would import bytes the caller never transmitted.
+        status, body = self.call("POST", "/api/materials", {
+            "voyage": "KX-26-03",
+            "materials": [{"name": "lab.txt", "kind": "lab",
+                           "path": str(FIXTURES / "lab_results_1.txt")}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("path", body["error"])
+        status, listed = self.call("GET", "/api/materials?voyage=KX-26-03")
+        self.assertEqual(listed["items"], [])
+
+    def test_http_body_import_attests_its_own_bytes(self) -> None:
+        status, body = self.call("POST", "/api/materials", {
+            "voyage": "KX-26-03",
+            "materials": [{"name": "lab.txt", "kind": "lab",
+                           "content": (FIXTURES / "lab_results_1.txt").read_text("utf-8")}],
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(body["items"][0]["trust"], "trusted")
+        self.assertFalse(body["items"][0]["verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

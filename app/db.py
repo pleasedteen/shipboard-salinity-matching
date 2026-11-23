@@ -20,6 +20,9 @@ SCHEMA: tuple[str, ...] = (
         path TEXT,
         content TEXT NOT NULL,
         content_sha TEXT NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'body',
+        trust TEXT NOT NULL DEFAULT 'trusted',
+        verified_at TEXT,
         status TEXT NOT NULL,
         version INTEGER NOT NULL,
         imported_at TEXT NOT NULL,
@@ -211,6 +214,17 @@ SCHEMA: tuple[str, ...] = (
 )
 
 
+# Columns added after the first release.  A database whose ``materials``
+# table predates them was populated while the service still accepted
+# server-side ``path`` imports, so every path-bearing version in it is treated
+# as untrusted until an operator re-submits the exact bytes from the local CLI.
+MATERIAL_SECURITY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("origin", "TEXT NOT NULL DEFAULT 'body'"),
+    ("trust", "TEXT NOT NULL DEFAULT 'trusted'"),
+    ("verified_at", "TEXT"),
+)
+
+
 class Database:
     """DB-API wrapper for SQLite (embedded) and PostgreSQL (production).
 
@@ -361,7 +375,40 @@ class Database:
             with self.transaction():
                 for statement in SCHEMA:
                     self._execute(statement)
+                self._migrate_material_security()
             self._schema_ready = True
+
+    def _migrate_material_security(self) -> None:
+        """Add trust columns to an older database and quarantine legacy paths.
+
+        ``ALTER TABLE ... ADD COLUMN`` is portable across SQLite and
+        PostgreSQL.  A database that did not yet have the ``trust`` column was
+        written before HTTP body-only imports were enforced, so any material
+        version that recorded a server-side path is an unverified legacy copy:
+        it is marked untrusted and stays out of resolution and query results
+        until an operator re-submits exactly those bytes from the local CLI.
+        """
+        existing = set(self.column_names("materials"))
+        for name, ddl in MATERIAL_SECURITY_COLUMNS:
+            if name not in existing:
+                self._execute(f"ALTER TABLE materials ADD COLUMN {name} {ddl}")
+        # Every path-bearing version written before this feature is an
+        # unverified legacy copy.  Rows already imported by the local CLI keep
+        # their trust, so re-running this is harmless and an operator's later
+        # local verification is never undone by a restart.
+        self.quarantine_changed = self.execute(
+            "UPDATE materials SET trust = 'quarantined', origin = 'legacy_path' "
+            "WHERE path IS NOT NULL AND path <> '' AND trust = 'trusted' "
+            "AND COALESCE(origin, 'body') NOT IN ('local_cli', 'local_verified')"
+        ) > 0
+
+    def column_names(self, table: str) -> list[str]:
+        """Column names of a table, without dialect-specific catalog queries."""
+        with self._lock:
+            cur = self._execute(f"SELECT * FROM {table} WHERE 1 = 0")
+            names = [d[0] for d in cur.description]
+            cur.close()
+            return names
 
     def ping(self) -> bool:
         row = self.fetchone("SELECT 1 AS ok")

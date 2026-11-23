@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -194,13 +193,18 @@ def parse_material_payload(body: Any) -> list[MaterialInput]:
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             raise ServiceError(f"materials[{index}] must be an object")
+        if "path" in item:
+            # Reading a server-side file from an HTTP request would import
+            # bytes the caller never actually transmitted and cannot vouch
+            # for.  Files are only read through the local CLI.
+            raise ServiceError(
+                f"materials[{index}]: 'path' is not accepted over HTTP; "
+                "send the material's text as 'content'"
+            )
         content = item.get("content")
         name = item.get("name")
-        if content is None and item.get("path"):
-            content = Path(item["path"]).read_text(encoding="utf-8")
-            name = name or Path(item["path"]).name
         if content is None:
-            raise ServiceError(f"materials[{index}] needs 'content' or 'path'")
+            raise ServiceError(f"materials[{index}] needs 'content'")
         if not name:
             name = slugify((item.get("slug") or f"material-{index}"))
         materials.append(MaterialInput(
@@ -209,7 +213,8 @@ def parse_material_payload(body: Any) -> list[MaterialInput]:
             kind=item.get("kind"),
             voyage=item.get("voyage") or body.get("voyage") or "default",
             slug=item.get("slug"),
-            path=item.get("path"),
+            path=None,
+            local=False,
         ))
     return materials
 
@@ -282,6 +287,8 @@ POST /api/materials
          "materials": [{"name": "deck.html", "kind": "deck", "content": "..."}]}
   kind is one of deck | handover | lab; it may be omitted and is then guessed
   from the filename and text. Re-posting identical content is a no-op.
+  Only the material body is accepted: a "path" field is rejected (400) because
+  server-side file reads are available exclusively through the local CLI.
 
 POST /api/materials/{slug}/revise   Body: {"content": "..."}
   Replaces one material and re-runs only the batches that consume it.
@@ -293,6 +300,9 @@ POST /api/materials/{slug}/withdraw
 
 GET  /api/materials?voyage=...&history=true
 GET  /api/materials/{slug}?voyage=...
+  A quarantined (legacy path) version reports content_available=false and
+  returns no body or extracted rows. Re-send its exact bytes from the local
+  CLI to verify it.
 GET  /api/batches?voyage=...&status=published|in_review|held
 GET  /api/batches/{batch_id_or_code}
 GET  /api/samples?voyage=...&batch=...&station=...&label=...&min_salinity=...

@@ -126,6 +126,78 @@ def demo() -> str:
     return "\n".join(lines)
 
 
+def legacy_demo() -> str:
+    """Walk through a locally-built old library: quarantine → verify → restart."""
+    from legacy import build_legacy_library, local_import, material_rows
+
+    lines: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "legacy.db"
+        # The "old library" fixture: the same materials imported by the old
+        # build, with a server-side path recorded for every version.
+        build_legacy_library(db_path)
+        settings = Settings(database_url=f"sqlite:///{db_path}",
+                            fixture_dir=ROOT / "fixtures")
+        service = SamplingService(settings=settings)
+        try:
+            trust = {r["trust"] for r in material_rows(db_path)}
+            lines.append("1. Opened the legacy library")
+            lines.append(f"   - {len(material_rows(db_path))} path-bearing versions, "
+                         f"trust={','.join(sorted(trust))}")
+
+            statuses = {b["batch_code"]: b["status"] for b in service.list_batches()}
+            lines.append(f"   - batches: {', '.join(f'{k}:{v}' for k, v in statuses.items())}")
+            assert set(statuses.values()) == {"held"}, statuses
+            assert service.query_samples(voyage=VOYAGE)["total"] == 0
+
+            detail = service.get_material("handover", voyage=VOYAGE)
+            lines.append("")
+            lines.append("2. Remote (HTTP) view of a quarantined version")
+            lines.append(f"   - content_available={detail['content_available']} "
+                         f"quarantined={detail['quarantined']} "
+                         f"raw_records={len(detail['raw_records'])}")
+            assert not detail["content_available"]
+            assert detail["raw_records"] == []
+
+            lines.append("")
+            lines.append("3. Operator re-sends the exact bytes from the local CLI")
+            reports = local_import(service)
+            lines.append("   - " + ", ".join(
+                f"{r.slug}:{r.status}" for r in reports))
+            assert all(r.verified and r.trust == "trusted" for r in reports)
+            statuses = {b["batch_code"]: b["status"] for b in service.list_batches()}
+            lines.append(f"   - batches: {', '.join(f'{k}:{v}' for k, v in statuses.items())}")
+            assert statuses["KX-2603-A"] == "published"
+            assert statuses["KX-2603-E"] == "held"
+            assert statuses["KX-2603-G"] == "in_review"
+            samples = service.query_samples(voyage=VOYAGE)["total"]
+            lines.append(f"   - {samples} published rows now queryable")
+            assert samples == 18
+            verified = service.get_material("handover", voyage=VOYAGE)
+            assert verified["content_available"]
+
+            # A restart must reopen the same verified state without re-quarantining.
+            snapshots = {b["batch_code"]: (b["status"], b["version"])
+                         for b in service.list_batches()}
+        finally:
+            service.db.close()
+
+        reopened = SamplingService(settings=settings)
+        try:
+            lines.append("")
+            lines.append("4. Reopened the database")
+            again = {b["batch_code"]: (b["status"], b["version"])
+                     for b in reopened.list_batches()}
+            lines.append(f"   - batch state unchanged: {again == snapshots}")
+            assert again == snapshots
+            assert {r["trust"] for r in material_rows(db_path)
+                    if r["status"] == "active"} == {"trusted"}
+            assert reopened.query_samples(voyage=VOYAGE)["total"] == 18
+        finally:
+            reopened.db.close()
+    return "\n".join(lines)
+
+
 def main() -> int:
     started = time.time()
     print("=" * 72)
@@ -140,6 +212,15 @@ def main() -> int:
     print("Fixture walk-through")
     print("=" * 72)
     print(service_summary := demo())
+    print()
+    print("=" * 72)
+    print("Legacy library walk-through (quarantine → local verification → restart)")
+    print("=" * 72)
+    try:
+        print(legacy_demo())
+    except AssertionError as exc:
+        ok = False
+        print(f"legacy walk-through FAILED: {exc!r}")
     print()
     elapsed = time.time() - started
     print("=" * 72)

@@ -62,6 +62,10 @@ class MaterialInput:
     voyage: str = DEFAULT_VOYAGE
     slug: str | None = None
     path: str | None = None
+    # True only when the bytes were read and submitted by the local CLI.  The
+    # HTTP API accepts request bodies only, so an HTTP submission can never
+    # attest the contents of a server-side file.
+    local: bool = False
 
 
 @dataclass
@@ -73,11 +77,13 @@ class IngestReport:
     created: bool = False
     unchanged: bool = False
     withdrawn: bool = False
+    verified: bool = False
     records: int = 0
     replaced_material_id: str | None = None
     affected_batches: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     status: str = "ok"
+    trust: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -86,9 +92,11 @@ class IngestReport:
             "slug": self.slug,
             "kind": self.kind,
             "status": self.status,
+            "trust": self.trust,
             "created": self.created,
             "unchanged": self.unchanged,
             "withdrawn": self.withdrawn,
+            "verified": self.verified,
             "records": self.records,
             "replaced_material_id": self.replaced_material_id,
             "affected_batches": self.affected_batches,
@@ -111,6 +119,15 @@ def slugify(value: str) -> str:
 
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_trusted(material: dict[str, Any] | None) -> bool:
+    """A material version may inform results only when its bytes are verified.
+
+    Versions written by the local CLI are attested.  Legacy versions that
+    recorded a server-side path stay quarantined until re-sent locally.
+    """
+    return bool(material) and (material.get("trust") or "trusted") == "trusted"
 
 
 def _bottle(row: dict[str, Any]) -> matching.Bottle:
@@ -199,6 +216,17 @@ class SamplingService:
         self.db = db or Database(self.settings.database_url)
         self.db.ensure_schema()
         self._recover_runs()
+        # Opening a legacy database may have quarantined previously active
+        # path-bearing versions, so derived state is recomputed once from the
+        # remaining trusted materials.
+        if getattr(self.db, "quarantine_changed", False):
+            self._refresh_all()
+
+    def _refresh_all(self) -> None:
+        with self.db.transaction():
+            self._refresh_lab_activity()
+            for row in self.db.fetchall("SELECT DISTINCT voyage FROM materials"):
+                self._resolve_voyage(row["voyage"])
 
     # ==================================================================
     # Runs (resumability / observability)
@@ -274,6 +302,23 @@ class SamplingService:
             self._withdraw(existing, report)
             return report
 
+        if material.path and not material.local:
+            # Only the local CLI may read a server-side file.  An HTTP caller
+            # must send the material body itself so the bytes it imported are
+            # exactly the bytes recorded here.
+            raise ServiceError(
+                "path imports are only available through the local CLI; "
+                "submit the material as 'content' over HTTP"
+            )
+
+        # An operator re-sending the exact bytes from the local CLI can verify a
+        # quarantined legacy version.  Only the local machine can vouch for a
+        # file's contents, so this is the sole path out of quarantine.
+        if material.local:
+            quarantined = self._quarantined_version(voyage, slug, sha)
+            if quarantined is not None:
+                return self._verify_quarantined(quarantined, report)
+
         # Content-addressed identity: identical bytes never create a second
         # material record, even under an explicit replace request.
         prior = self.db.fetchone(
@@ -282,9 +327,23 @@ class SamplingService:
             (voyage, slug, sha),
         )
         if prior is not None:
+            if not _is_trusted(prior):
+                # Identical bytes arriving over HTTP do not clear a quarantine;
+                # the original version still needs local verification.
+                report.material_id = prior["id"]
+                report.trust = prior["trust"]
+                report.unchanged = True
+                report.status = "quarantined"
+                report.records = self._record_count(prior["id"])
+                report.warnings.append(
+                    "this content matches a quarantined legacy version; "
+                    "re-send it through the local CLI to verify the original"
+                )
+                return report
             previous_active = existing if existing and existing["id"] != prior["id"] else None
             if existing is not None and existing["id"] == prior["id"]:
                 report.material_id = prior["id"]
+                report.trust = prior["trust"]
                 report.unchanged = True
                 report.status = "unchanged"
                 report.records = self._record_count(prior["id"])
@@ -306,6 +365,7 @@ class SamplingService:
                           prior["content"], prior["kind"])
             self._refresh_lab_activity()
             report.material_id = prior["id"]
+            report.trust = prior["trust"]
             if previous_active is not None:
                 # Restoring an earlier version is a real change of the active
                 # content even though no new material record is created.
@@ -348,6 +408,9 @@ class SamplingService:
             "path": material.path,
             "content": material.content,
             "content_sha": sha,
+            "origin": "local_cli" if material.local else "body",
+            "trust": "trusted",
+            "verified_at": stamp if material.local else None,
             "status": "active",
             "version": version,
             "imported_at": stamp,
@@ -356,6 +419,7 @@ class SamplingService:
         extraction = self._extract(material_id, voyage, slug, material.name,
                                    material.content, kind)
         report.material_id = material_id
+        report.trust = "trusted"
         report.created = True
         report.status = "created"
         report.records = len(extraction.findings)
@@ -376,6 +440,57 @@ class SamplingService:
             "SELECT COUNT(*) FROM raw_records WHERE material_id = ?", (material_id,), 0
         ) or 0)
 
+    def _quarantined_version(self, voyage: str, slug: str,
+                             sha: str) -> dict[str, Any] | None:
+        return self.db.fetchone(
+            "SELECT * FROM materials WHERE voyage = ? AND slug = ? AND content_sha = ? "
+            "AND trust = 'quarantined' ORDER BY version DESC LIMIT 1",
+            (voyage, slug, sha),
+        )
+
+    def _verify_quarantined(self, material: dict[str, Any],
+                            report: IngestReport) -> IngestReport:
+        """Attest a quarantined version with the exact bytes re-sent locally.
+
+        Only the local machine can vouch for a server-side file, so this is
+        the sole route out of quarantine.  The version keeps its history: an
+        active version becomes usable again and is resolved anew, while a
+        superseded or withdrawn version is merely marked verified so the
+        historical state is preserved.
+        """
+        stamp = now_iso()
+        material_id = material["id"]
+        affected = set(self._batch_keys_for_material(material_id))
+        self.db.execute(
+            "UPDATE materials SET trust = 'trusted', origin = 'local_verified', "
+            "verified_at = ?, updated_at = ? WHERE id = ?",
+            (stamp, stamp, material_id),
+        )
+        report.material_id = material_id
+        report.trust = "trusted"
+        report.verified = True
+        report.status = "verified"
+        report.records = self._record_count(material_id)
+        # A version that was replaced or withdrawn keeps its historical state;
+        # only re-deriving it (below) would make it inform results, and that
+        # happens for the active version alone.
+        if material["status"] != "active":
+            report.affected_batches = sorted(affected)
+            return report
+        extraction = self._extract(material_id, material["voyage"], material["slug"],
+                                   material["name"], material["content"], material["kind"])
+        self._refresh_lab_activity()
+        if material["kind"] == "handover":
+            affected |= set(self._batch_keys_for_voyage(material["voyage"]))
+        elif material["kind"] == "lab":
+            affected |= self._batch_keys_for_lab(material["voyage"], extraction.findings)
+        elif material["kind"] == "deck":
+            affected |= self._batch_keys_for_deck(material["voyage"], extraction.findings)
+        report.records = len(extraction.findings)
+        report.affected_batches = sorted(affected)
+        self._refresh_batches(report.affected_batches)
+        return report
+
     def _withdraw(self, material: dict[str, Any], report: IngestReport) -> None:
         stamp = now_iso()
         material_id = material["id"]
@@ -390,14 +505,15 @@ class SamplingService:
         if material["kind"] == "lab":
             self._refresh_lab_activity()
         report.material_id = material_id
+        report.trust = material.get("trust")
         report.withdrawn = True
         report.status = "withdrawn"
         report.affected_batches = sorted(affected)
         self._refresh_batches(report.affected_batches)
 
     def list_materials(self, voyage: str | None = None, include_history: bool = False) -> list[dict[str, Any]]:
-        query = ("SELECT id, slug, voyage, kind, name, path, content_sha, status, version, "
-                 "imported_at, updated_at FROM materials")
+        query = ("SELECT id, slug, voyage, kind, name, path, content_sha, origin, trust, "
+                 "verified_at, status, version, imported_at, updated_at FROM materials")
         clauses: list[str] = []
         params: list[Any] = []
         if voyage:
@@ -414,9 +530,26 @@ class SamplingService:
         return rows
 
     def get_material(self, slug: str, voyage: str | None = None,
-                     include_records: bool = True) -> dict[str, Any]:
+                     include_records: bool = True, local: bool = False) -> dict[str, Any]:
         material = self._material_by_slug(slug, voyage)
         data = {k: v for k, v in material.items() if k != "content"}
+        trusted = _is_trusted(material)
+        if not trusted and not local:
+            # The original body and everything extracted from a quarantined
+            # version are withheld from remote callers; only the local machine
+            # can inspect and re-verify them.
+            data.update({
+                "content_available": False,
+                "quarantined": True,
+                "raw_records": [],
+            })
+            data["affected_batches"] = self._batch_keys_for_material(material["id"])
+            return data
+        data["quarantined"] = not trusted
+        data["content_available"] = True
+        if local:
+            # Only the local machine may inspect the stored original.
+            data["content"] = material.get("content")
         if include_records:
             data["raw_records"] = [
                 {
@@ -561,14 +694,16 @@ class SamplingService:
         """A laboratory result is usable only while its material is active.
 
         ``present`` records whether the current extraction of that material
-        still contains the row; ``active`` adds the material-level condition.
-        Keeping them separate means reverting to an earlier material version
-        restores exactly the rows that version contained.
+        still contains the row; ``active`` adds the material-level condition:
+        the material must be active *and* trusted.  Keeping them separate means
+        reverting to an earlier material version restores exactly the rows that
+        version contained, and a quarantined legacy version contributes
+        nothing.
         """
         self.db.execute(
             "UPDATE lab_results SET active = CASE WHEN present = 1 AND EXISTS ("
             "SELECT 1 FROM materials m WHERE m.id = lab_results.material_id "
-            "AND m.status = 'active') THEN 1 ELSE 0 END"
+            "AND m.status = 'active' AND m.trust = 'trusted') THEN 1 ELSE 0 END"
         )
 
     # ==================================================================
@@ -706,14 +841,16 @@ class SamplingService:
             "SELECT r.*, m.slug AS material_slug, m.name AS material_name, "
             "m.version AS material_version, m.id AS material_id FROM raw_records r "
             "JOIN materials m ON m.id = r.material_id "
-            "WHERE r.kind = 'handover' AND m.status = 'active' AND m.voyage = ? "
+            "WHERE r.kind = 'handover' AND m.status = 'active' "
+            "AND m.trust = 'trusted' AND m.voyage = ? "
             "ORDER BY m.updated_at, r.ordinal",
             (voyage,),
         )
         deck_rows = self.db.fetchall(
             "SELECT r.*, m.slug AS material_slug, m.name AS material_name "
             "FROM raw_records r JOIN materials m ON m.id = r.material_id "
-            "WHERE r.kind = 'deck' AND m.status = 'active' AND m.voyage = ? "
+            "WHERE r.kind = 'deck' AND m.status = 'active' "
+            "AND m.trust = 'trusted' AND m.voyage = ? "
             "ORDER BY m.updated_at, r.ordinal",
             (voyage,),
         )
@@ -791,7 +928,8 @@ class SamplingService:
         codes = self.db.fetchall(
             "SELECT r.payload, m.id AS material_id FROM raw_records r "
             "JOIN materials m ON m.id = r.material_id "
-            "WHERE r.kind = 'handover' AND m.status = 'active' AND m.voyage = ? "
+            "WHERE r.kind = 'handover' AND m.status = 'active' "
+            "AND m.trust = 'trusted' AND m.voyage = ? "
             "ORDER BY m.updated_at, r.ordinal",
             (voyage,),
         )
@@ -1198,7 +1336,8 @@ class SamplingService:
         published = len(rows)
         pending = max(0, len(bottles) - published)
         comparison = canonical_json([
-            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"]]
+            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"],
+             row.get("payload")]
             for row in rows
         ] + [["__status__", status]])
         latest = self.db.fetchall(
@@ -1206,7 +1345,8 @@ class SamplingService:
             (batch["id"], current_version),
         ) if current_version else []
         latest_comparison = canonical_json([
-            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"]]
+            [row["bottle_id"], row["lab_result_id"], row["state"], row["salinity"],
+             row.get("payload")]
             for row in latest
         ] + [["__status__", batch.get("status")]])
         stamp = now_iso()
@@ -1348,7 +1488,7 @@ class SamplingService:
             row = self.db.fetchone(
                 "SELECT r.*, m.slug, m.name AS file_name FROM raw_records r "
                 "JOIN materials m ON m.id = r.material_id "
-                "WHERE r.material_id = ? AND r.record_key = ?",
+                "WHERE r.material_id = ? AND r.record_key = ? AND m.trust = 'trusted'",
                 (material_id, record_key),
             )
             if row is not None:
@@ -1575,6 +1715,8 @@ class SamplingService:
                     else bottle["confidence"],
                     "matching": res["matching_confidence"] if res else None,
                 },
+                # These locators are derived only from trusted materials; a
+                # quarantined version contributes neither bottles nor results.
                 "provenance": {
                     "handover": from_json(bottle.get("locator"), {}),
                     "deck": payload.get("deck_locators", []),
@@ -1717,7 +1859,8 @@ class SamplingService:
     # Review queue and decisions
     # ==================================================================
     def list_review_queue(self, status: str = "open", batch: str | None = None,
-                          voyage: str | None = None, limit: int = 200) -> dict[str, Any]:
+                          voyage: str | None = None, limit: int = 200,
+                          local: bool = False) -> dict[str, Any]:
         clauses = ["status = ?"]
         params: list[Any] = [status]
         if batch:
@@ -1735,36 +1878,75 @@ class SamplingService:
                 "SELECT COUNT(*) FROM review_items WHERE status = ?", (state,), 0) or 0)
             for state in ("open", "resolved", "stale", "closed")
         }
+        quarantined = set() if local else self._quarantined_refs()
         return {
-            "items": [self._review_public(r) for r in rows[:limit]],
+            "items": [self._review_public(r, quarantined) for r in rows[:limit]],
             "counts": counts,
             "limit": limit,
+            # A remote caller also sees, per active material, whether its bytes
+            # are verified, so an operator knows a local check is pending.
+            "materials": self._material_trust_summary(voyage),
         }
 
-    def get_review_item(self, item_id: str) -> dict[str, Any]:
+    def _material_trust_summary(self, voyage: str | None) -> list[dict[str, Any]]:
+        query = ("SELECT slug, kind, name, trust FROM materials WHERE status = 'active'")
+        params: list[Any] = []
+        if voyage:
+            query += " AND voyage = ?"
+            params.append(slugify(voyage))
+        query += " ORDER BY slug"
+        return [
+            {
+                "slug": row["slug"],
+                "kind": row["kind"],
+                "name": row["name"],
+                "trust": row["trust"],
+                "quarantined": row["trust"] != "trusted",
+                "verify_from_local_cli": row["trust"] != "trusted",
+            }
+            for row in self.db.fetchall(query, params)
+        ]
+
+    def _quarantined_refs(self) -> set[str]:
+        """Identifiers (ids and slugs) of active, unverified materials."""
+        rows = self.db.fetchall(
+            "SELECT id, slug FROM materials WHERE status = 'active' AND trust <> 'trusted'"
+        )
+        return {row["id"] for row in rows} | {row["slug"] for row in rows}
+
+    def get_review_item(self, item_id: str, local: bool = False) -> dict[str, Any]:
         row = self.db.fetchone("SELECT * FROM review_items WHERE id = ?", (item_id,))
         if row is None:
             raise NotFound(f"review item '{item_id}' not found")
-        public = self._review_public(row)
+        redacted = set() if local else self._quarantined_refs()
+        public = self._review_public(row, redacted)
         material = self.db.fetchone(
-            "SELECT id, slug, name, kind FROM materials WHERE slug = ? AND status = 'active'",
-            (row["source_material"],),
+            "SELECT id, slug, name, kind, trust FROM materials WHERE status = 'active' "
+            "AND (slug = ? OR id = ?)",
+            (row["source_material"], row["source_material"]),
         ) if row["source_material"] else None
         if material:
-            public["source"] = {
+            trusted = _is_trusted(material)
+            source = {
                 "material_id": material["id"],
                 "slug": material["slug"],
                 "name": material["name"],
                 "kind": material["kind"],
-                "content": self.db.scalar(
-                    "SELECT content FROM materials WHERE id = ?", (material["id"],), ""
-                ),
+                "trust": material["trust"],
+                "content_available": trusted or local,
             }
+            if trusted or local:
+                source["content"] = self.db.scalar(
+                    "SELECT content FROM materials WHERE id = ?", (material["id"],), ""
+                )
+            public["source"] = source
         return public
 
-    def _review_public(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _review_public(self, row: dict[str, Any],
+                       quarantined: set[str] | None = None) -> dict[str, Any]:
         batch = self.db.fetchone("SELECT * FROM batches WHERE id = ?", (row["batch_id"],)) \
             if row["batch_id"] else None
+        hide = bool(quarantined) and row.get("source_material") in quarantined
         return {
             "id": row["id"],
             "scope": row["scope"],
@@ -1778,10 +1960,14 @@ class SamplingService:
             "voyage": row["voyage"],
             "record_key": row["record_key"],
             "field": row["field"],
-            "payload": from_json(row["payload"], {}),
-            "candidates": from_json(row["candidates"], []),
-            "locator": from_json(row["locator"], {}),
+            # A quarantined version's extracted fields, candidates and原文
+            # excerpt are withheld over HTTP; only its existence and status
+            # remain visible so an operator knows local verification is needed.
+            "payload": {} if hide else from_json(row["payload"], {}),
+            "candidates": [] if hide else from_json(row["candidates"], []),
+            "locator": {} if hide else from_json(row["locator"], {}),
             "source_material": row["source_material"],
+            "quarantined": hide,
             "decision_id": row["decision_id"],
             "reviewer": row["reviewer"],
             "note": row["note"],
@@ -1789,7 +1975,8 @@ class SamplingService:
         }
 
     def decide(self, item_id: str, action: str, reviewer: str | None = None,
-               note: str | None = None, value: dict[str, Any] | None = None) -> dict[str, Any]:
+               note: str | None = None, value: dict[str, Any] | None = None,
+               local: bool = False) -> dict[str, Any]:
         item = self.db.fetchone("SELECT * FROM review_items WHERE id = ?", (item_id,))
         if item is None:
             raise NotFound(f"review item '{item_id}' not found")
@@ -1799,6 +1986,13 @@ class SamplingService:
             if item["batch_id"] else None
         if batch is None:
             raise Conflict("review item is not linked to an existing batch")
+        if not local and item.get("source_material") in self._quarantined_refs():
+            # Acting on a quarantined version would mean trusting content the
+            # remote caller cannot see; that must be done on the local machine.
+            raise Conflict(
+                "this review item depends on a quarantined material; "
+                "verify the original from the local CLI first"
+            )
         with self.db.transaction():
             if item["kind"] == "ambiguous_assignment":
                 self._decide_assignment(item, batch, action, reviewer, note, value or {})
@@ -1810,7 +2004,9 @@ class SamplingService:
                 raise ServiceError(f"unsupported review item kind '{item['kind']}'")
             self._resolve_voyage(batch["voyage"])
         refreshed = self.db.fetchone("SELECT * FROM review_items WHERE id = ?", (item_id,))
-        return self._review_public(refreshed) if refreshed else {"id": item_id}
+        redacted = set() if local else self._quarantined_refs()
+        return (self._review_public(refreshed, redacted)
+                if refreshed else {"id": item_id})
 
     def _upsert_decision(self, decision_key: str, values: dict[str, Any]) -> str:
         prior = self.db.fetchone(
@@ -2075,11 +2271,13 @@ class SamplingService:
     # Convenience operations
     # ==================================================================
     def revise_material(self, slug: str, content: str, kind: str | None = None,
-                        voyage: str | None = None) -> IngestReport:
+                        voyage: str | None = None, local: bool = False) -> IngestReport:
         material = self._material_by_slug(slug, voyage)
         return self.import_materials([MaterialInput(
             name=material["name"], content=content, kind=kind or material["kind"],
-            voyage=material["voyage"], slug=material["slug"], path=material.get("path"),
+            voyage=material["voyage"], slug=material["slug"],
+            path=material.get("path") if local else None,
+            local=local,
         )], replace=True, trigger="revise")[0]
 
     def withdraw_material(self, slug: str, voyage: str | None = None) -> IngestReport:

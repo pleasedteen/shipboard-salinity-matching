@@ -8,6 +8,8 @@
 - 整批配不齐的批次暂缓发布，其余批照常处理。
 - 复核队列展示候选与原文；核正后结果立即反映到查询接口。
 - 单独替换或撤回一份材料只重跑受影响的批次；材料含义未变时既有复核决定继续有效。
+- HTTP 导入只接收正文；服务端读文件仅限本机 CLI。
+- 旧库中带路径的材料版本自动隔离：不参与配对与查询，原文不对外返回；操作员在本机 CLI 原样重送即可核验。
 - 重复导入不增加记录；中断后可重跑。
 
 ---
@@ -59,14 +61,14 @@ python3 run.py review  --status open
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `name` | 是 | 文件名，用于推断类型与显示 |
-| `content` | 是* | 材料的完整文本（HTML 或纯文本） |
-| `path` | 是* | 与 `content` 二选一，服务端读取该文件 |
+| `content` | HTTP 必填 | 材料的完整文本（HTML 或纯文本） |
+| `path` | 仅本机 CLI | 仅命令行导入可用：由本机读取该文件并随请求记录路径 |
 | `kind` | 否 | `deck` / `handover` / `lab`；省略时按内容与文件名推断 |
 | `slug` | 否 | 材料标识；省略时由文件名生成。同名材料第二次导入即为“替换” |
 | `voyage` | 否 | 航次命名空间，默认 `default`。同一航次内批次号唯一 |
 | `replace` | 否 | 请求级参数；语义见第 4 节 |
 
-\* `content` 与 `path` 至少提供一个。
+\* HTTP 请求必须携带 `content`；`path` 只允许在本机 CLI 使用，HTTP 请求中出现 `path` 会被拒绝（400）。这样服务端入库记录的字节始终就是调用方实际提交的字节。
 
 ### 三类材料
 
@@ -107,10 +109,19 @@ POST /api/materials
 }
 ```
 
-返回每份材料的处理结果：`status`（`created` / `unchanged` / `reverted` / `restored` / `withdrawn`）、抽到的记录数 `records`、受影响的批次 `affected_batches`、`warnings`。
+返回每份材料的处理结果：`status`（`created` / `unchanged` / `reverted` / `restored` / `withdrawn` / `verified` / `quarantined`）、抽到的记录数 `records`、受影响的批次 `affected_batches`、`warnings`、可信状态 `trust`（`trusted` / `quarantined`）与 `verified`。
 
 - 相同内容重复提交（包括 `replace: true`）不会新建材料，也不会改变任何批次。
 - 文件名相同但内容不同：替换该材料，旧版本标记为 `superseded`，只重跑受影响的批次。
+
+### 可信材料与隔离（旧库升级）
+
+HTTP 导入只接收正文，服务端从不代调用方读取文件；只有本机 CLI 会读取文件路径，并把该版本标记为可信（`trust=trusted`）。由旧版本写入、带 `path` 的材料版本在打开库时进入隔离（`trust=quarantined`）：
+
+- 被隔离的版本不参与批次配对、查询与复核重算；依赖它们的批次转为 `held`。
+- HTTP 不返回隔离版本的原文或抽取内容：`GET /api/materials/{slug}` 返回 `content_available=false`、空 `raw_records`；复核队列中相关条目 `payload`/`candidates`/`locator` 为空并标 `quarantined=true`；对这些条目的远端复核会被拒绝（409）。
+- 本机 CLI 原样重送同一版字节即可核验（`status=verified`）：仍生效的材料恢复配对，被替换或撤回的版本仅更新为可信、保留其历史状态。
+- 打开旧库后首次会按可信材料重算批次与查询，结果在重启后保持一致。
 
 ### 替换 / 撤回一份材料
 
@@ -250,9 +261,11 @@ python3 run.py --database "$DATABASE_URL" import --fixtures fixtures --voyage KX
 ## 7. 测试与夹具
 
 ```bash
-python3 verify.py                        # 全部测试 + 走查（约 7–8 秒，远低于 80 秒）
+python3 verify.py                        # 全部测试 + 走查（约 9–10 秒，远低于 80 秒）
 python3 -m unittest discover -s tests -t tests -v
 ```
+
+`verify.py` 除常规测试与夹具走查外，还包含一段**旧库走查**（`tests/legacy.py` 现场重建旧版数据库）：打开带 `path` 的旧库 → 确认全部版本被隔离、批次全部 `held`、HTTP 视图不含原文 → 本机 CLI 原样重送 → 确认恢复配对（A 发布、E 暂缓、G 待复核、18 行可查询）→ 重开数据库确认状态不变。
 
 夹具（`fixtures/`）覆盖题目要求的各种材料特征，且无需访问外部站点：
 
@@ -290,4 +303,9 @@ run.py          命令行入口（serve / import / revise / withdraw / query / r
 verify.py       一条命令完成验证
 fixtures/       材料夹具
 tests/          自动化测试（标准库 unittest）
+tests/legacy.py 旧库夹具：按旧版表结构重建带 path 的数据库
 ```
+
+### 材料可信字段
+
+材料的 `GET /api/materials` 结果包含 `trust`（`trusted` / `quarantined`）、`origin`（`body` / `local_cli` / `local_verified` / `legacy_path`）与 `verified_at`。`GET /api/materials/{slug}` 对隔离版本返回 `content_available=false` 且不返回原文；本机 CLI 可查看原文以便核验。

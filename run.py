@@ -53,6 +53,7 @@ def collect_materials(paths: list[str], voyage: str, kind: str | None) -> list[M
                 kind=kind,
                 voyage=voyage,
                 path=str(item),
+                local=True,
             ))
     return materials
 
@@ -72,7 +73,8 @@ def cmd_import(args: argparse.Namespace) -> int:
 def cmd_revise(args: argparse.Namespace) -> int:
     service = service_for(args)
     content = Path(args.file).read_text(encoding="utf-8")
-    report = service.revise_material(args.slug, content, kind=args.kind, voyage=args.voyage)
+    report = service.revise_material(args.slug, content, kind=args.kind,
+                                     voyage=args.voyage, local=True)
     print(json.dumps(report.public(), ensure_ascii=False, indent=2))
     return 0
 
@@ -113,13 +115,16 @@ def cmd_review(args: argparse.Namespace) -> int:
         value = json.loads(args.value) if args.value else {}
         item = service.decide(
             args.decide, args.action, reviewer=args.reviewer, note=args.note, value=value,
+            local=True,
         )
         print(json.dumps(item, ensure_ascii=False, indent=2))
     elif args.item:
-        print(json.dumps(service.get_review_item(args.item), ensure_ascii=False, indent=2))
+        print(json.dumps(service.get_review_item(args.item, local=True),
+                         ensure_ascii=False, indent=2))
     else:
         print(json.dumps(service.list_review_queue(
             status=args.status, batch=args.batch, voyage=args.voyage, limit=args.limit,
+            local=True,
         ), ensure_ascii=False, indent=2))
     return 0
 
