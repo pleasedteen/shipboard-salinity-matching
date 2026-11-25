@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import matching
+from . import allocation, matching
 from .config import Settings
 from .db import Database
 from .document import parse_document
@@ -753,38 +753,128 @@ class SamplingService:
         if not active:
             return
 
-        # Priority: explicit laboratory batch hints first (they are definitive),
-        # then the smaller batches, then batch code, so contention is resolved
-        # deterministically rather than by import order.
+        # Explicit laboratory batch hints are definitive and also provide a
+        # stable priority when several maximum allocations are possible.
         hint_counts = self._hinted_batch_ids(voyage)
         ordered = sorted(
             active.values(),
             key=lambda b: (0 if hint_counts.get(b["id"]) else 1,
-                           int(b["bottle_count"] or 0), b["batch_code"]),
+                           int(b["bottle_count"] or 0), b["batch_code"], b["id"]),
         )
 
-        # Resolve in a fixed priority order, accumulating claims as we go.  A
-        # result is visible to at most one batch, and because earlier batches
-        # never have to give a result back, the outcome is deterministic rather
-        # than dependent on import order or iteration count.
-        claimed: set[str] = set()
-        unresolved: list[dict[str, Any]] = []
+        # Build every unclaimed batch graph first.  A voyage-wide exact solver
+        # can then reassign a result along a contention chain instead of
+        # letting the first batch that sees a result keep it forever.
+        graph_inputs: dict[str, dict[str, Any]] = {}
+        preliminary_groups: list[allocation.AllocationGroup] = []
         for batch in ordered:
-            used = self._evaluate(batch, claimed)
-            claimed |= used
-            if self._batch_row(batch["voyage"], batch["batch_code"])["status"] == "held":
-                unresolved.append(batch)
-        # A held batch claimed nothing, so a second pass cannot change any
-        # decision; it only makes sure held batches were evaluated against the
-        # final claim set.
-        for batch in unresolved:
-            self._evaluate(batch, claimed)
-        for batch_id, (rows, bottles) in getattr(self, "_pending_inputs", {}).items():
+            bottle_rows = self.db.fetchall(
+                "SELECT * FROM batch_bottles WHERE batch_id = ? ORDER BY ordinal",
+                (batch["id"],),
+            )
+            bottles = [_bottle(row) for row in bottle_rows]
+            results = self._result_pool(batch, None)
+            edges = [edge for bottle in bottles for result in results
+                     if (edge := matching.edge_for(
+                         bottle, result, batch["batch_code"],
+                         batch.get("sample_start"), batch.get("sample_end")))]
+            local_context = matching.assignment_context(
+                batch["batch_code"], bottles, results, edges)
+            pins = self._active_pins(batch)
+            graph_inputs[batch["id"]] = {
+                "bottles": bottles,
+                "results": results,
+                "edges": edges,
+                "context": local_context,
+            }
+            preliminary_groups.append(allocation.AllocationGroup(
+                key=batch["id"],
+                bottles=tuple(b.key for b in bottles),
+                edges=tuple(edges),
+                pins=tuple(sorted(pins.items())),
+                priority=(0 if hint_counts.get(batch["id"]) else 1,
+                          int(batch.get("bottle_count") or 0),
+                          batch["batch_code"], batch["id"]),
+            ))
+
+        component_sets = allocation.contention_components(preliminary_groups)
+        global_facts_by_batch = self._global_context_facts(
+            ordered, graph_inputs, component_sets)
+        contexts: dict[str, str] = {}
+        for batch in ordered:
+            data = graph_inputs[batch["id"]]
+            context = matching.assignment_context(
+                batch["batch_code"], data["bottles"], data["results"], data["edges"],
+                global_facts=global_facts_by_batch.get(batch["id"]),
+            )
+            contexts[batch["id"]] = context
+            # Invalidate before constructing the final solver so a changed
+            # cross-batch contention graph releases stale reviewer pins.
+            self._invalidate_stale_assignment_decisions(batch, context)
+
+        final_groups: list[allocation.AllocationGroup] = []
+        pins_by_batch: dict[str, dict[str, str]] = {}
+        for batch in ordered:
+            pins = self._active_pins(batch)
+            pins_by_batch[batch["id"]] = pins
+            data = graph_inputs[batch["id"]]
+            final_groups.append(allocation.AllocationGroup(
+                key=batch["id"],
+                bottles=tuple(b.key for b in data["bottles"]),
+                edges=tuple(data["edges"]),
+                pins=tuple(sorted(pins.items())),
+                priority=(0 if hint_counts.get(batch["id"]) else 1,
+                          int(batch.get("bottle_count") or 0),
+                          batch["batch_code"], batch["id"]),
+            ))
+        allocation_report = allocation.solve_allocations(final_groups)
+
+        for batch in ordered:
+            self._evaluate(
+                batch,
+                allocation_view=allocation_report.views.get(batch["id"]),
+                resolved_context=contexts[batch["id"]],
+                resolved_graph=graph_inputs[batch["id"]],
+                resolved_pins=pins_by_batch[batch["id"]],
+            )
+
+        for batch_id, (rows, bottle_dicts) in getattr(self, "_pending_inputs", {}).items():
             batch = next((b for b in ordered if b["id"] == batch_id), None)
             if batch is None:
                 continue
-            results = self._result_pool(batch, set())
-            self._store_inputs(batch_id, rows, bottles, results)
+            results = graph_inputs.get(batch_id, {}).get("results")
+            if results is None:
+                results = self._result_pool(batch, set())
+            self._store_inputs(batch_id, rows, bottle_dicts, results)
+
+    def _global_context_facts(
+        self,
+        batches: list[dict[str, Any]],
+        graph_inputs: dict[str, dict[str, Any]],
+        components: list[set[str]],
+    ) -> dict[str, dict[str, Any]]:
+        batch_map = {batch["id"]: batch for batch in batches}
+        facts: dict[str, dict[str, Any]] = {}
+        for component in components:
+            codes = sorted(
+                normalize_station(batch_map[batch_id]["batch_code"])
+                for batch_id in component if batch_id in batch_map
+            )
+            edge_facts: list[list[str]] = []
+            for batch_id in component:
+                batch = batch_map.get(batch_id)
+                if batch is None:
+                    continue
+                for edge in graph_inputs.get(batch_id, {}).get("edges", []):
+                    edge_facts.append([
+                        normalize_station(batch["batch_code"]),
+                        edge.bottle_key,
+                        edge.result_key,
+                    ])
+            fact = {"batches": codes, "edges": sorted(edge_facts)}
+            for batch_id in component:
+                facts[batch_id] = fact
+        return facts
 
     def _ensure_batches(self, voyage: str) -> None:
         """Create a batch row for each dispatch code an active handover defines."""
@@ -1046,7 +1136,12 @@ class SamplingService:
         return True  # nothing distinguishes it; the matcher decides
 
     def _evaluate(self, batch: dict[str, Any],
-                  claimed_elsewhere: set[str] | None = None) -> set[str]:
+                  claimed_elsewhere: set[str] | None = None,
+                  *,
+                  allocation_view: allocation.GroupView | None = None,
+                  resolved_context: str | None = None,
+                  resolved_graph: dict[str, Any] | None = None,
+                  resolved_pins: dict[str, str] | None = None) -> set[str]:
         """Recompute one batch.  Returns the result keys it currently uses.
 
         Pairings are only written to the query tables when *every* bottle has
@@ -1055,36 +1150,47 @@ class SamplingService:
         feasible complete pairing are published; the rest wait in review.  If
         no complete pairing exists, nothing is published for that batch.
         """
-        bottles = [_bottle(r) for r in self.db.fetchall(
-            "SELECT * FROM batch_bottles WHERE batch_id = ? ORDER BY ordinal", (batch["id"],)
-        )]
-        results = self._result_pool(batch, claimed_elsewhere)
-        edges = [edge for bottle in bottles for result in results
-                 if (edge := matching.edge_for(bottle, result, batch["batch_code"],
-                                               batch.get("sample_start"),
-                                               batch.get("sample_end")))]
-        context = matching.assignment_context(batch["batch_code"], bottles, results, edges)
+        if resolved_graph is not None:
+            bottles = resolved_graph["bottles"]
+            results = resolved_graph["results"]
+            edges = resolved_graph["edges"]
+        else:
+            bottles = [_bottle(r) for r in self.db.fetchall(
+                "SELECT * FROM batch_bottles WHERE batch_id = ? ORDER BY ordinal", (batch["id"],)
+            )]
+            results = self._result_pool(batch, claimed_elsewhere)
+            edges = [edge for bottle in bottles for result in results
+                     if (edge := matching.edge_for(bottle, result, batch["batch_code"],
+                                                   batch.get("sample_start"),
+                                                   batch.get("sample_end")))]
+        context = resolved_context or matching.assignment_context(
+            batch["batch_code"], bottles, results, edges)
 
         self._invalidate_stale_assignment_decisions(batch, context)
-        pins = self._active_pins(batch)
-        feasibility = matching.feasible([b.key for b in bottles], edges, pins=pins)
+        pins = self._active_pins(batch) if resolved_pins is None else resolved_pins
+        local_feasibility = matching.feasible([b.key for b in bottles], edges, pins=pins)
+        feasibility, global_hold_reason = self._global_feasibility(
+            local_feasibility, allocation_view, bottles, pins)
 
         status: str
         reason: str | None = None
         if not bottles:
             status, reason = "held", "handover lists no bottles"
-        elif not feasibility.perfect:
+        elif not local_feasibility.perfect:
             status = "held"
-            if feasibility.unmatched_bottles:
-                reason = (f"no complete pairing: {len(feasibility.unmatched_bottles)} "
+            if local_feasibility.unmatched_bottles:
+                reason = (f"no complete pairing: {len(local_feasibility.unmatched_bottles)} "
                           "bottle(s) have no compatible laboratory result")
             else:
                 reason = "results cannot be paired one-to-one with the batch bottles"
+        elif global_hold_reason:
+            status = "held"
+            reason = global_hold_reason
         elif feasibility.ambiguous:
             status = "in_review"
             reason = (f"{len(feasibility.ambiguous)} bottle(s) have more than one feasible "
-                      "laboratory result; only pairings identical across all supported "
-                      "options are published")
+                      "laboratory result; only pairings identical across all optimal "
+                      "allocation plans are published")
         else:
             status, reason = "published", None
 
@@ -1096,6 +1202,61 @@ class SamplingService:
         # Both fully published and partially published (in-review) rows are
         # claimed, so a sibling batch can never publish the same result.
         return {row["lab_result_id"] for row in rows} if status in ("published", "in_review") else set()
+
+    def _global_feasibility(
+        self,
+        local: matching.Feasibility,
+        view: allocation.GroupView | None,
+        bottles: list[matching.Bottle],
+        pins: dict[str, str],
+    ) -> tuple[matching.Feasibility, str | None]:
+        if view is None:
+            return local, None
+        if not local.perfect or not view.reachable or not view.optimal_indexes:
+            return local, (
+                "no complete pairing in an allocation that completes the maximum "
+                "possible number of dispatch batches"
+            )
+
+        # The deterministic priority reconstruction chooses one maximum plan.
+        # A sibling omitted by that reconstruction is held initially, but its
+        # review/hold confirmation can move the claim while preserving the
+        # same maximum batch count.  Active pins always make a group required.
+        if not view.priority_selected and not pins:
+            return local, (
+                "no complete pairing: the shared result is assigned to another "
+                "batch in a maximum-batch allocation"
+            )
+
+        bottle_keys = [bottle.key for bottle in bottles]
+        candidates: dict[str, list[str]] = {
+            bottle_key: list(view.candidates.get(bottle_key, ()))
+            for bottle_key in bottle_keys
+        }
+        assignment: dict[str, str] = {}
+        ambiguous: dict[str, list[str]] = {}
+        for bottle_key, options in candidates.items():
+            forced_result = view.forced.get(bottle_key)
+            if forced_result is not None:
+                assignment[bottle_key] = forced_result
+            elif len(options) == 1 and view.priority_selected:
+                # Stable priority tie-break between maximum batch subsets.
+                assignment[bottle_key] = options[0]
+            if len(options) > 1 and forced_result is None:
+                ambiguous[bottle_key] = options
+
+        if any(not options for options in candidates.values()):
+            return local, "results cannot be paired one-to-one with the batch bottles"
+        if len(set(assignment.values())) != len(assignment):
+            return local, "results cannot be paired one-to-one with the batch bottles"
+        return matching.Feasibility(
+            perfect=True,
+            assignment=assignment,
+            candidates=candidates,
+            ambiguous=ambiguous,
+            unmatched_bottles=[],
+            matching_count_hint=len(ambiguous),
+        ), None
 
     def _invalidate_stale_assignment_decisions(self, batch: dict[str, Any], context: str) -> None:
         rows = self.db.fetchall(
@@ -1848,6 +2009,42 @@ class SamplingService:
                                                batch.get("sample_start"), batch.get("sample_end")))]
         return bottles, results, edges
 
+    def _voyage_allocation_groups(self, voyage: str) -> list[allocation.AllocationGroup]:
+        batches = self.db.fetchall(
+            "SELECT * FROM batches WHERE voyage = ? ORDER BY batch_code, id", (voyage,)
+        )
+        groups: list[allocation.AllocationGroup] = []
+        for batch in batches:
+            bottles, _results, edges = self._matching_inputs(batch)
+            if not bottles:
+                continue
+            pins = self._active_pins(batch)
+            groups.append(allocation.AllocationGroup(
+                key=batch["id"],
+                bottles=tuple(bottle.key for bottle in bottles),
+                edges=tuple(edges),
+                pins=tuple(sorted(pins.items())),
+            ))
+        return groups
+
+    def _assert_pins_preserve_optimum(
+        self,
+        batch: dict[str, Any],
+        extra_pins: dict[str, str],
+    ) -> None:
+        """Reject a review choice that lowers the maximum complete-batch count."""
+        groups = self._voyage_allocation_groups(batch["voyage"])
+        base = allocation.maximum_complete_batches(groups)
+        feasible = allocation.maximum_with_pins(
+            groups, {batch["id"]: dict(extra_pins)}
+        )
+        if feasible < base:
+            raise ServiceError(
+                "that attribution cannot be accepted: it would reduce the number "
+                f"of fully paired dispatch batches from {base} to {feasible}",
+                code="allocation_not_optimal",
+            )
+
     def _decide_assignment(self, item: dict[str, Any], batch: dict[str, Any], action: str,
                            reviewer: str | None, note: str | None, value: dict[str, Any]) -> None:
         if action == "reject":
@@ -1874,6 +2071,7 @@ class SamplingService:
         edge_keys = {(e.bottle_key, e.result_key) for e in edges}
         if (bottle_key, result_key) not in edge_keys:
             raise ServiceError("that bottle/result pairing is not supported by the materials")
+        self._assert_pins_preserve_optimum(batch, {bottle_key: result_key})
         context = item["context_fingerprint"]
         pins = self._active_pins(batch)
         pins[bottle_key] = result_key
@@ -2035,6 +2233,7 @@ class SamplingService:
             )
             if not ok:
                 raise ServiceError(error or "invalid assignment")
+            self._assert_pins_preserve_optimum(batch, assignment)
             context = item["context_fingerprint"]
             decision_id = self._upsert_decision(
                 f"assignment:{batch['id']}:manual",

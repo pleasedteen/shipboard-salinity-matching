@@ -321,6 +321,7 @@ def feasible(
     bottles: list[str],
     edges: list[Edge],
     pins: dict[str, str] | None = None,
+    blocked_results: set[str] | None = None,
 ) -> Feasibility:
     """Find a perfect matching and every result that can belong to each bottle.
 
@@ -341,32 +342,65 @@ def feasible(
             return Feasibility(False, {}, {}, {}, sorted(bottle_set), 0)
 
     remaining = [b for b in bottles if b not in pins]
-    blocked = set(pins.values())
-    matching = find_matching(remaining, edges, blocked)
+    blocked = set(pins.values()) | set(blocked_results or set())
+    visible_edges = [e for e in edges if e.result_key not in blocked]
+    matching = find_matching(remaining, visible_edges)
     if matching is None:
         return Feasibility(False, {}, {}, {}, sorted(remaining), 0)
 
-    adjacency = _adjacency(remaining, (e for e in edges if e.result_key not in blocked))
-    graph: dict[str, set[str]] = {b: set() for b in remaining}
+    adjacency = _adjacency(remaining, visible_edges)
     owner = {result: bottle for bottle, result in matching.items()}
+
+    # Alternating graph on bottles: u -> v when u is adjacent to the result
+    # currently matched to v.  SCCs identify swaps on alternating cycles.
+    graph: dict[str, set[str]] = {b: set() for b in remaining}
+    free_capable: set[str] = set()
     for bottle in remaining:
         for result in adjacency.get(bottle, ()):
             counterpart = owner.get(result)
-            if counterpart is not None and counterpart != bottle:
+            if counterpart is None:
+                # This bottle can move directly to an unmatched result.
+                free_capable.add(bottle)
+            elif counterpart != bottle:
                 graph[bottle].add(counterpart)
+
     component = _scc(remaining, graph)
-    members: dict[int, list[str]] = {}
-    for bottle in remaining:
-        members.setdefault(component[bottle], []).append(bottle)
+    reverse: dict[str, set[str]] = {b: set() for b in remaining}
+    for bottle, counterparts in graph.items():
+        for counterpart in counterparts:
+            reverse.setdefault(counterpart, set()).add(bottle)
+
+    # Nodes that can start an alternating path ending at an unmatched result.
+    stack = list(free_capable)
+    can_finish = set(free_capable)
+    while stack:
+        node = stack.pop()
+        for predecessor in reverse.get(node, ()):  # pragma: no branch - small graph
+            if predecessor not in can_finish:
+                can_finish.add(predecessor)
+                stack.append(predecessor)
 
     candidates: dict[str, list[str]] = {}
     ambiguous: dict[str, list[str]] = {}
     for bottle in remaining:
-        comp = members[component[bottle]]
-        options = sorted({matching[member] for member in comp})
-        candidates[bottle] = options
-        if len(options) > 1:
-            ambiguous[bottle] = options
+        options: set[str] = set()
+        for result in adjacency.get(bottle, ()):
+            counterpart = owner.get(result)
+            if counterpart is None:
+                allowed = True
+            else:
+                allowed = (
+                    counterpart in can_finish
+                    or component.get(counterpart) == component.get(bottle)
+                )
+            if allowed:
+                options.add(result)
+        if not options and bottle in matching:
+            options.add(matching[bottle])
+        ordered_options = sorted(options)
+        candidates[bottle] = ordered_options
+        if len(ordered_options) > 1:
+            ambiguous[bottle] = ordered_options
 
     assignment = dict(pins)
     for bottle, options in candidates.items():
@@ -427,6 +461,7 @@ def assignment_context(
     bottles: list[Bottle],
     results: list[Result],
     edges: list[Edge],
+    global_facts: dict[str, Any] | None = None,
 ) -> str:
     """Fingerprint the semantic facts and feasible options behind an assignment.
 
@@ -464,4 +499,6 @@ def assignment_context(
         ),
         "edges": sorted([e.bottle_key, e.result_key] for e in edges),
     }
+    if global_facts is not None:
+        payload["global_allocation"] = global_facts
     return canonical_json(payload)
