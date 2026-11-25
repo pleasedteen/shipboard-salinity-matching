@@ -457,7 +457,7 @@ class SamplingService:
                  content: str, kind: str):
         document = parse_document(content, name)
         result = EXTRACTORS[kind](document, slug, name)
-        corrections = self._corrections_for({f.record_key for f in result.findings})
+        corrections = self._corrections_for(voyage, {f.record_key for f in result.findings})
         for finding in result.findings:
             decision = corrections.get(finding.record_key)
             if not decision:
@@ -489,13 +489,13 @@ class SamplingService:
             self._sync_lab_results(material_id, voyage, result.findings)
         return result
 
-    def _corrections_for(self, record_keys: set[str]) -> dict[str, dict[str, Any]]:
+    def _corrections_for(self, voyage: str, record_keys: set[str]) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         for record_key in sorted(record_keys):
             rows = self.db.fetchall(
-                "SELECT * FROM review_decisions WHERE record_key = ? AND kind = 'correction' "
-                "AND active = 1 ORDER BY updated_at DESC",
-                (record_key,),
+                "SELECT * FROM review_decisions WHERE voyage = ? AND record_key = ? "
+                "AND kind = 'correction' AND active = 1 ORDER BY updated_at DESC",
+                (voyage, record_key),
             )
             if not rows:
                 continue
@@ -512,7 +512,8 @@ class SamplingService:
             record_key = finding.record_key
             keep.add(record_key)
             existing = self.db.fetchone(
-                "SELECT id FROM lab_results WHERE record_key = ?", (record_key,)
+                "SELECT id FROM lab_results WHERE voyage = ? AND record_key = ?",
+                (voyage, record_key),
             )
             values = {
                 "record_key": record_key,
@@ -543,7 +544,7 @@ class SamplingService:
                 }),
             }
             if existing is None:
-                values["id"] = short_id("lab", record_key)
+                values["id"] = short_id("lab", voyage, record_key)
                 self.db.insert("lab_results", values)
             else:
                 updates = {k: v for k, v in values.items() if k != "record_key"}
@@ -784,7 +785,7 @@ class SamplingService:
             if batch is None:
                 continue
             results = self._result_pool(batch, set())
-            self._store_inputs(batch_id, rows, bottles, results)
+            self._store_inputs(batch_id, voyage, rows, bottles, results)
 
     def _ensure_batches(self, voyage: str) -> None:
         """Create a batch row for each dispatch code an active handover defines."""
@@ -963,7 +964,7 @@ class SamplingService:
                 "payload": to_json(bottle["payload"]),
             })
 
-    def _store_inputs(self, batch_id: str, handover_rows: list[dict[str, Any]],
+    def _store_inputs(self, batch_id: str, voyage: str, handover_rows: list[dict[str, Any]],
                       bottles: list[dict[str, Any]],
                       results: list[matching.Result] | None = None) -> None:
         """Link this batch to the exact source records it consumes.
@@ -980,8 +981,10 @@ class SamplingService:
         for bottle in bottles:
             for deck_key in bottle["deck_keys"]:
                 deck = self.db.fetchone(
-                    "SELECT material_id FROM raw_records WHERE record_key = ? AND kind = 'deck'",
-                    (deck_key,),
+                    "SELECT r.material_id FROM raw_records r JOIN materials m "
+                    "ON m.id = r.material_id WHERE r.record_key = ? AND r.kind = 'deck' "
+                    "AND m.voyage = ?",
+                    (deck_key, voyage),
                 )
                 if deck:
                     linked.add((deck["material_id"], "deck", deck_key))
@@ -1166,6 +1169,7 @@ class SamplingService:
                 "decision_id": decision_ids.get((bottle_key, result_key)),
                 "payload": to_json({
                     "bottle_locator": bottle.locator,
+                    "deck_keys": list(bottle.deck_keys),
                     "deck_locators": bottle.deck_locators,
                     "result_locator": result.locator,
                     "bottle_confidence": bottle.confidence,
@@ -1289,6 +1293,7 @@ class SamplingService:
                 candidates=candidates,
                 locator=_first_locator(bottles),
                 source_material=batch.get("handover_material_id"),
+                source_material_id=batch.get("handover_material_id"),
                 context=context,
             )
         elif status == "in_review":
@@ -1327,6 +1332,8 @@ class SamplingService:
                     record_key=bottle_key,
                     locator=bottle.locator,
                     source_material=bottle.extra.get("source_material"),
+                    source_material_id=self._material_id_for_slug(
+                        batch["voyage"], bottle.extra.get("source_material")),
                     context=context,
                 )
 
@@ -1391,6 +1398,7 @@ class SamplingService:
                 field=",".join(low_fields) or "row",
                 locator=from_json(row["locator"], {}),
                 source_material=row["slug"],
+                source_material_id=row["material_id"],
                 context=context,
             )
 
@@ -1427,8 +1435,8 @@ class SamplingService:
             for key in ("title", "detail"):
                 if prior[key] != item[key]:
                     updates[key] = item[key]
-            for key in ("payload", "candidates", "locator"):
-                if prior[key] != item[key]:
+            for key in ("payload", "candidates", "locator", "source_material_id"):
+                if item.get(key) is not None and prior.get(key) != item.get(key):
                     updates[key] = item[key]
             if resolved:
                 updates.update({"decision_id": prior["decision_id"],
@@ -1483,6 +1491,7 @@ class SamplingService:
                      kind: str, status: str, title: str, detail: str, payload: dict[str, Any],
                      candidates: Any, record_key: str | None = None, field: str | None = None,
                      locator: dict[str, Any] | None = None, source_material: str | None = None,
+                     source_material_id: str | None = None,
                      context: str | None = None) -> dict[str, Any]:
         return {
             "id": short_id("rev", subject),
@@ -1501,6 +1510,7 @@ class SamplingService:
             "candidates": to_json(candidates),
             "locator": to_json(locator or {}),
             "source_material": source_material,
+            "source_material_id": source_material_id,
             "context_fingerprint": context,
             "decision_id": None,
             "reviewer": None,
@@ -1543,6 +1553,7 @@ class SamplingService:
     def get_batch(self, batch_ref: str) -> dict[str, Any]:
         row = self._find_batch(batch_ref)
         data = self._batch_public(row)
+        voyage = row["voyage"]
         results = self.db.fetchall(
             "SELECT * FROM batch_results WHERE batch_id = ? AND batch_version = ? ORDER BY bottle_id",
             (row["id"], row["version"]),
@@ -1552,7 +1563,7 @@ class SamplingService:
         )
         bottle_map = {b["record_key"]: b for b in bottles}
         lab_map = {r["record_key"]: r for r in self.db.fetchall(
-            "SELECT * FROM lab_results WHERE active = 1 AND voyage = ?", (row["voyage"],)
+            "SELECT * FROM lab_results WHERE active = 1 AND voyage = ?", (voyage,)
         )}
         by_bottle = {r["bottle_id"]: r for r in results}
         items = []
@@ -1574,11 +1585,14 @@ class SamplingService:
                     "extraction": res["extraction_confidence"] if res
                     else bottle["confidence"],
                     "matching": res["matching_confidence"] if res else None,
+                    "bottle": bottle["confidence"],
+                    "result": lab["confidence"] if lab else None,
                 },
                 "provenance": {
                     "handover": from_json(bottle.get("locator"), {}),
-                    "deck": payload.get("deck_locators", []),
+                    "deck": self._live_deck_locators(voyage, payload.get("deck_keys") or []),
                     "lab": from_json(lab.get("locator"), {}) if lab else {},
+                    "matching_reasons": payload.get("matching_reasons", []),
                 },
                 "matching_reasons": payload.get("matching_reasons", []),
             })
@@ -1632,6 +1646,19 @@ class SamplingService:
             "updated_at": row["updated_at"],
         }
 
+    def _live_deck_locators(self, voyage: str, deck_keys: list[str]) -> list[dict[str, Any]]:
+        """Current deck provenance for a bottle, after any material revision."""
+        if not deck_keys:
+            return []
+        placeholders = ", ".join("?" for _ in deck_keys)
+        rows = self.db.fetchall(
+            f"SELECT r.locator AS locator FROM raw_records r JOIN materials m "
+            f"ON m.id = r.material_id WHERE r.kind = 'deck' AND m.voyage = ? "
+            f"AND m.status = 'active' AND r.record_key IN ({placeholders})",
+            [voyage, *deck_keys],
+        )
+        return [from_json(r["locator"], {}) for r in rows if r["locator"]]
+
     def query_samples(
         self,
         voyage: str | None = None,
@@ -1652,7 +1679,8 @@ class SamplingService:
             "lr.confidence AS result_confidence, lr.payload AS result_payload "
             "FROM batch_results br JOIN batches b ON b.id = br.batch_id "
             "JOIN batch_bottles bb ON bb.batch_id = br.batch_id AND bb.record_key = br.bottle_id "
-            "LEFT JOIN lab_results lr ON lr.record_key = br.lab_result_id AND lr.active = 1 "
+            "LEFT JOIN lab_results lr ON lr.record_key = br.lab_result_id "
+            "AND lr.voyage = b.voyage AND lr.active = 1 "
             "WHERE br.batch_version = b.version"
         )
         params: list[Any] = []
@@ -1683,6 +1711,7 @@ class SamplingService:
         for row in rows[offset: offset + limit]:
             payload = from_json(row.get("payload"), {})
             lab_payload = from_json(row.get("result_payload"), {})
+            deck_keys = payload.get("deck_keys") or []
             items.append({
                 "batch": row["batch_code"],
                 "batch_id": row["batch_id"],
@@ -1705,7 +1734,7 @@ class SamplingService:
                 },
                 "provenance": {
                     "handover": row["bottle_locator"] and from_json(row["bottle_locator"], {}),
-                    "deck": payload.get("deck_locators", []),
+                    "deck": self._live_deck_locators(row["voyage"], deck_keys),
                     "lab": row["result_locator"] and from_json(row["result_locator"], {}),
                     "lab_reasons": lab_payload.get("reason_codes", []),
                     "matching_reasons": payload.get("matching_reasons", []),
@@ -1730,9 +1759,16 @@ class SamplingService:
         query = ("SELECT * FROM review_items WHERE " + " AND ".join(clauses)
                  + " ORDER BY created_at, subject_key")
         rows = self.db.fetchall(query, params)
+        count_clauses: list[str] = []
+        count_params: list[Any] = []
+        if voyage:
+            count_clauses.append("voyage = ?")
+            count_params.append(slugify(voyage))
         counts = {
             state: int(self.db.scalar(
-                "SELECT COUNT(*) FROM review_items WHERE status = ?", (state,), 0) or 0)
+                "SELECT COUNT(*) FROM review_items WHERE status = ?"
+                + (" AND " + " AND ".join(count_clauses) if count_clauses else ""),
+                tuple([state] + count_params), 0) or 0)
             for state in ("open", "resolved", "stale", "closed")
         }
         return {
@@ -1746,10 +1782,22 @@ class SamplingService:
         if row is None:
             raise NotFound(f"review item '{item_id}' not found")
         public = self._review_public(row)
-        material = self.db.fetchone(
-            "SELECT id, slug, name, kind FROM materials WHERE slug = ? AND status = 'active'",
-            (row["source_material"],),
-        ) if row["source_material"] else None
+        material = None
+        # Prefer the exact material version the item was raised against, always
+        # inside the item's own voyage; a same-named report in another voyage
+        # must never be opened here.
+        material_id = row.get("source_material_id")
+        if material_id:
+            material = self.db.fetchone(
+                "SELECT id, slug, name, kind FROM materials WHERE id = ? AND voyage = ?",
+                (material_id, row["voyage"]),
+            )
+        if material is None and row["source_material"]:
+            material = self.db.fetchone(
+                "SELECT id, slug, name, kind FROM materials "
+                "WHERE voyage = ? AND slug = ? AND status = 'active'",
+                (row["voyage"], row["source_material"]),
+            )
         if material:
             public["source"] = {
                 "material_id": material["id"],
@@ -1761,6 +1809,15 @@ class SamplingService:
                 ),
             }
         return public
+
+    def _material_id_for_slug(self, voyage: str, slug: str | None) -> str | None:
+        if not slug:
+            return None
+        row = self.db.fetchone(
+            "SELECT id FROM materials WHERE voyage = ? AND slug = ? AND status = 'active'",
+            (voyage, slug),
+        )
+        return row["id"] if row else None
 
     def _review_public(self, row: dict[str, Any]) -> dict[str, Any]:
         batch = self.db.fetchone("SELECT * FROM batches WHERE id = ?", (row["batch_id"],)) \
@@ -1782,6 +1839,7 @@ class SamplingService:
             "candidates": from_json(row["candidates"], []),
             "locator": from_json(row["locator"], {}),
             "source_material": row["source_material"],
+            "source_material_id": row.get("source_material_id"),
             "decision_id": row["decision_id"],
             "reviewer": row["reviewer"],
             "note": row["note"],
@@ -1794,11 +1852,13 @@ class SamplingService:
         if item is None:
             raise NotFound(f"review item '{item_id}' not found")
         if item["status"] == "stale":
-            raise Conflict("this review item is stale; wait for the next import or refresh the batch")
+            raise Conflict("this review item is stale; refresh the review detail and try again")
         batch = self.db.fetchone("SELECT * FROM batches WHERE id = ?", (item["batch_id"],)) \
             if item["batch_id"] else None
         if batch is None:
             raise Conflict("review item is not linked to an existing batch")
+        if item["kind"] == "low_confidence_extraction":
+            self._assert_extraction_item_current(item, batch)
         with self.db.transaction():
             if item["kind"] == "ambiguous_assignment":
                 self._decide_assignment(item, batch, action, reviewer, note, value or {})
@@ -1927,6 +1987,33 @@ class SamplingService:
             "updated_at": now_iso(),
         })
 
+    def _assert_extraction_item_current(self, item: dict[str, Any], batch: dict[str, Any]) -> None:
+        """Reject a correction submitted against a pre-revision detail view.
+
+        Material revisions move or rewrite source rows.  The review item is
+        updated in place during re-resolution, so a still-open item can carry a
+        newer row than the detail the reviewer is looking at.  Such a submission
+        must only prompt a refresh; it is never written to any material version.
+        """
+        record = self.db.fetchone(
+            "SELECT r.*, m.status AS material_status, m.voyage AS material_voyage "
+            "FROM raw_records r JOIN materials m ON m.id = r.material_id "
+            "WHERE r.record_key = ? AND m.voyage = ? AND m.status = 'active'",
+            (item["record_key"], batch["voyage"]),
+        )
+        if record is None:
+            raise Conflict("the source material changed; refresh the review detail and try again")
+        if item.get("batch_version") != int(batch["version"] or 0):
+            raise Conflict("this batch was re-resolved; refresh the review detail and try again")
+        current_locator = from_json(record["locator"], {})
+        if current_locator != from_json(item.get("locator"), {}):
+            raise Conflict("the source row moved after a material revision; "
+                           "refresh the review detail and try again")
+        snapshot = from_json(item.get("payload"), {}).get("fields") or {}
+        if canonical_json(_identity_public(snapshot)) != record["fingerprint"]:
+            raise Conflict("the source row changed after a material revision; "
+                           "refresh the review detail and try again")
+
     def _decide_extraction(self, item: dict[str, Any], batch: dict[str, Any], action: str,
                            reviewer: str | None, note: str | None, value: dict[str, Any]) -> None:
         if action not in ("correct", "confirm", "reject"):
@@ -1939,7 +2026,11 @@ class SamplingService:
             })
             return
         record_key = item["record_key"]
-        record = self.db.fetchone("SELECT * FROM raw_records WHERE record_key = ?", (record_key,))
+        record = self.db.fetchone(
+            "SELECT r.* FROM raw_records r JOIN materials m ON m.id = r.material_id "
+            "WHERE r.record_key = ? AND m.voyage = ?",
+            (record_key, batch["voyage"]),
+        )
         if record is None:
             raise NotFound(f"source record '{record_key}' not found")
         original = from_json(record["payload"], {})
@@ -1950,7 +2041,7 @@ class SamplingService:
         corrected = _normalise_corrected({**original, **fields})
 
         decision_id = self._upsert_decision(
-            f"correction:{record_key}",
+            f"correction:{batch['voyage']}:{record_key}",
             {
                 "kind": "correction",
                 "voyage": batch["voyage"],
@@ -1969,7 +2060,11 @@ class SamplingService:
             "fingerprint": canonical_json(_identity_public(corrected)),
         })
         if record["kind"] == "lab":
-            lab = self.db.fetchone("SELECT id FROM lab_results WHERE record_key = ?", (record_key,))
+            lab = self.db.fetchone(
+                "SELECT lr.id FROM lab_results lr JOIN materials m "
+                "ON m.id = lr.material_id WHERE lr.record_key = ? AND lr.voyage = ?",
+                (record_key, batch["voyage"]),
+            )
             if lab:
                 self.db.update("lab_results", lab["id"], {
                     "label_raw": corrected.get("label_raw"),

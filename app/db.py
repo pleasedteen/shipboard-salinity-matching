@@ -111,7 +111,7 @@ SCHEMA: tuple[str, ...] = (
         updated_at TEXT NOT NULL
     )
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_key ON lab_results(record_key)",
+    "CREATE INDEX IF NOT EXISTS idx_lab_key ON lab_results(voyage, record_key)",
     "CREATE INDEX IF NOT EXISTS idx_lab_active ON lab_results(voyage, active)",
     """
     CREATE TABLE IF NOT EXISTS batch_inputs (
@@ -188,6 +188,7 @@ SCHEMA: tuple[str, ...] = (
         candidates TEXT NOT NULL,
         locator TEXT,
         source_material TEXT,
+        source_material_id TEXT,
         context_fingerprint TEXT,
         decision_id TEXT,
         reviewer TEXT,
@@ -361,7 +362,53 @@ class Database:
             with self.transaction():
                 for statement in SCHEMA:
                     self._execute(statement)
+                self._run_migrations()
             self._schema_ready = True
+
+    def _run_migrations(self) -> None:
+        """Upgrade databases created by earlier versions, dialect-agnostically."""
+        # lab_results.record_key is unique only within a voyage; an older build
+        # enforced it globally, which made a same-named report in a second
+        # voyage overwrite the first voyage's laboratory rows.
+        if self.is_sqlite:
+            indexes = {
+                row["name"] for row in self.fetchall(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            if "idx_lab_key" in indexes:
+                sql = self.fetchone(
+                    "SELECT sql AS sql FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'idx_lab_key'"
+                )
+                if sql and "UNIQUE" in (sql["sql"] or "").upper():
+                    self._execute("DROP INDEX idx_lab_key")
+                    self._execute(
+                        "CREATE INDEX IF NOT EXISTS idx_lab_key "
+                        "ON lab_results(voyage, record_key)"
+                    )
+        else:  # PostgreSQL: recreate the index with the voyage-scoped shape.
+            self._execute("DROP INDEX IF EXISTS idx_lab_key")
+            self._execute(
+                "CREATE INDEX IF NOT EXISTS idx_lab_key "
+                "ON lab_results(voyage, record_key)"
+            )
+        # Review items remember the exact material version they were raised on
+        # so the detail view always opens that voyage's own source text.
+        columns = {row["name"] for row in self._table_columns("review_items")}
+        if "source_material_id" not in columns:
+            self._execute(
+                "ALTER TABLE review_items ADD COLUMN source_material_id TEXT"
+            )
+
+    def _table_columns(self, table: str) -> list[dict[str, Any]]:
+        # Cursor metadata works on both drivers (and the PostgreSQL test shim,
+        # which is itself backed by SQLite and has no information_schema).
+        with self._lock:
+            cur = self._execute(f"SELECT * FROM {table} LIMIT 0")
+            names = [d[0] for d in (cur.description or [])]
+            cur.close()
+        return [{"name": name} for name in names]
 
     def ping(self) -> bool:
         row = self.fetchone("SELECT 1 AS ok")
